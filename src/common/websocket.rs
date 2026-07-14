@@ -3044,13 +3044,13 @@ mod tests {
     use crate::errors::{WebsocketConnectionFailureReason, WebsocketError};
     use crate::models::{StreamId, TimeUnit};
     use async_trait::async_trait;
-    use flate2::{Compression, write::ZlibEncoder};
+    use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
     use futures::{SinkExt, StreamExt};
     use http::header::USER_AGENT;
     use regex::Regex;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashSet};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::marker::PhantomData;
     use std::net::SocketAddr;
     use std::sync::{
@@ -3167,6 +3167,76 @@ mod tests {
                 &*messages.lock().unwrap(),
                 &[text.to_string(), binary_text.to_string()]
             );
+        });
+    }
+
+    #[test]
+    fn configured_raw_observer_captures_frames_that_fail_in_the_public_reader() {
+        TOKIO_SHARED_RT.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let malformed_json = b"{not-json".to_vec();
+            let invalid_zlib = b"not-a-zlib-stream".to_vec();
+            assert!(serde_json::from_slice::<Value>(&malformed_json).is_err());
+            let mut decoded = String::new();
+            assert!(
+                ZlibDecoder::new(invalid_zlib.as_slice())
+                    .read_to_string(&mut decoded)
+                    .is_err(),
+                "fixture must fail zlib decompression"
+            );
+            let server_json = malformed_json.clone();
+            let server_zlib = invalid_zlib.clone();
+
+            let _server = AbortOnDrop(tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(stream).await.unwrap();
+                ws.send(Message::Text(
+                    String::from_utf8(server_json).unwrap().into(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::Binary(server_zlib.into())).await.unwrap();
+                ws.close(None).await.unwrap();
+            }));
+
+            let payloads = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+            let observer = {
+                let payloads = Arc::clone(&payloads);
+                RawFrameObserver::new(move |connection_id, payload| {
+                    assert_eq!(connection_id, "raw-public-reader");
+                    payloads.lock().unwrap().push(payload.to_vec());
+                })
+            };
+            let config = ConfigurationWebsocketStreams {
+                ws_url: Some(format!("ws://{addr}")),
+                mode: WebsocketMode::Single,
+                reconnect_delay: 500,
+                time_unit: None,
+                raw_frame_observer: Some(observer),
+                agent: None,
+                user_agent: build_user_agent("raw-reader-test"),
+            };
+            let streams = WebsocketStreams::new(
+                config,
+                vec![WebsocketConnection::new("raw-public-reader")],
+                vec![],
+            );
+
+            Arc::clone(&streams)
+                .connect(vec!["btcusdt@bookTicker".to_string()])
+                .await
+                .unwrap();
+            assert!(
+                eventually_async(Duration::from_secs(1), || {
+                    let payloads = Arc::clone(&payloads);
+                    async move { payloads.lock().unwrap().len() == 2 }
+                })
+                .await,
+                "reader did not pass both failing frames to the configured observer"
+            );
+
+            assert_eq!(&*payloads.lock().unwrap(), &[malformed_json, invalid_zlib]);
         });
     }
 
