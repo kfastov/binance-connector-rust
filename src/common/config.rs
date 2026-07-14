@@ -26,6 +26,34 @@ impl fmt::Debug for HttpAgent {
     }
 }
 
+/// Synchronous observer for WebSocket data-frame payloads.
+///
+/// The observer runs in the reader task before any UTF-8/JSON handling or
+/// binary decompression. Keep callbacks non-blocking; a typical callback
+/// copies the payload into an application-owned ring buffer.
+#[derive(Clone)]
+pub struct RawFrameObserver(pub Arc<dyn Fn(&str, &[u8]) + Send + Sync>);
+
+impl RawFrameObserver {
+    #[must_use]
+    pub fn new<F>(observer: F) -> Self
+    where
+        F: Fn(&str, &[u8]) + Send + Sync + 'static,
+    {
+        Self(Arc::new(observer))
+    }
+
+    pub(crate) fn observe(&self, connection_id: &str, payload: &[u8]) {
+        (self.0)(connection_id, payload);
+    }
+}
+
+impl fmt::Debug for RawFrameObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RawFrameObserver(<custom observer fn>)")
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyAuth {
     pub username: String,
@@ -326,6 +354,10 @@ pub struct ConfigurationWebsocketStreams {
 
     #[builder(setter(strip_option), default)]
     pub time_unit: Option<TimeUnit>,
+
+    /// Optional synchronous hook for raw Text/Binary payloads before decode.
+    #[builder(setter(strip_option), default)]
+    pub raw_frame_observer: Option<RawFrameObserver>,
 
     #[builder(setter(skip))]
     pub(crate) user_agent: String,

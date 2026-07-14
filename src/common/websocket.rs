@@ -38,7 +38,9 @@ use tokio_util::time::DelayQueue;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    config::{AgentConnector, ConfigurationWebsocketApi, ConfigurationWebsocketStreams},
+    config::{
+        AgentConnector, ConfigurationWebsocketApi, ConfigurationWebsocketStreams, RawFrameObserver,
+    },
     errors::{WebsocketConnectionFailureReason, WebsocketError},
     models::{StreamId, WebsocketApiResponse, WebsocketEvent, WebsocketMode},
     utils::{build_websocket_api_message, normalize_stream_id, random_string, validate_time_unit},
@@ -280,16 +282,38 @@ pub struct WebsocketCommon {
     reconnect_delay: usize,
     agent: Option<AgentConnector>,
     user_agent: Option<String>,
+    raw_frame_observer: Option<RawFrameObserver>,
 }
 
 impl WebsocketCommon {
     #[must_use]
     pub fn new(
+        initial_pool: Vec<Arc<WebsocketConnection>>,
+        mode: WebsocketMode,
+        reconnect_delay: usize,
+        agent: Option<AgentConnector>,
+        user_agent: Option<String>,
+    ) -> Arc<Self> {
+        Self::new_with_raw_frame_observer(
+            initial_pool,
+            mode,
+            reconnect_delay,
+            agent,
+            user_agent,
+            None,
+        )
+    }
+
+    /// Creates a WebSocket common runtime with a synchronous pre-decode
+    /// observer for Text/Binary payloads.
+    #[must_use]
+    pub fn new_with_raw_frame_observer(
         mut initial_pool: Vec<Arc<WebsocketConnection>>,
         mode: WebsocketMode,
         reconnect_delay: usize,
         agent: Option<AgentConnector>,
         user_agent: Option<String>,
+        raw_frame_observer: Option<RawFrameObserver>,
     ) -> Arc<Self> {
         if initial_pool.is_empty() {
             for _ in 0..mode.pool_size() {
@@ -311,6 +335,7 @@ impl WebsocketCommon {
             reconnect_delay,
             agent,
             user_agent,
+            raw_frame_observer,
         });
 
         Self::spawn_reconnect_loop(Arc::clone(&common), reconnect_rx);
@@ -739,6 +764,32 @@ impl WebsocketCommon {
         self.events.emit(&WebsocketEvent::Message(msg));
     }
 
+    /// Observes and then dispatches a text data-frame payload. The synchronous
+    /// observation establishes a strict happens-before edge with all handler
+    /// decoding.
+    async fn on_text_frame(&self, msg: String, connection: Arc<WebsocketConnection>) {
+        if let Some(observer) = &self.raw_frame_observer {
+            observer.observe(&connection.id, msg.as_bytes());
+        }
+        self.on_message(msg, connection).await;
+    }
+
+    /// Observes compressed bytes before decompression, then dispatches the
+    /// decompressed text through the regular handler path.
+    async fn on_binary_frame(&self, bin: &[u8], connection: Arc<WebsocketConnection>) {
+        if let Some(observer) = &self.raw_frame_observer {
+            observer.observe(&connection.id, bin);
+        }
+
+        let mut decoder = ZlibDecoder::new(bin);
+        let mut decompressed = String::new();
+        if let Err(err) = decoder.read_to_string(&mut decompressed) {
+            error!("Binary message decompress failed: {:?}", err);
+            return;
+        }
+        self.on_message(decompressed, connection).await;
+    }
+
     /// Creates a WebSocket connection with optional configuration and agent
     ///
     /// # Arguments
@@ -999,19 +1050,11 @@ impl WebsocketCommon {
                     match item {
                         Ok(Message::Text(msg)) => {
                             common
-                                .on_message(msg.to_string(), Arc::clone(&reader_conn))
+                                .on_text_frame(msg.to_string(), Arc::clone(&reader_conn))
                                 .await;
                         }
                         Ok(Message::Binary(bin)) => {
-                            let mut decoder = ZlibDecoder::new(&bin[..]);
-                            let mut decompressed = String::new();
-                            if let Err(err) = decoder.read_to_string(&mut decompressed) {
-                                error!("Binary message decompress failed: {:?}", err);
-                                continue;
-                            }
-                            common
-                                .on_message(decompressed, Arc::clone(&reader_conn))
-                                .await;
+                            common.on_binary_frame(&bin, Arc::clone(&reader_conn)).await;
                         }
                         Ok(Message::Ping(payload)) => {
                             info!("PING received from server on {}", reader_conn.id);
@@ -2087,13 +2130,14 @@ impl WebsocketStreams {
 
         let agent_clone = configuration.agent.clone();
         let user_agent_clone = configuration.user_agent.clone();
-        let common = WebsocketCommon::new(
+        let common = WebsocketCommon::new_with_raw_frame_observer(
             connection_pool,
             configuration.mode.clone(),
             usize::try_from(configuration.reconnect_delay)
                 .expect("reconnect_delay should fit in usize"),
             agent_clone,
             Some(user_agent_clone),
+            configuration.raw_frame_observer.clone(),
         );
         Arc::new(Self {
             common,
@@ -2994,19 +3038,23 @@ mod tests {
         WebsocketHandler, WebsocketMessageSendOptions, WebsocketMode, WebsocketSessionLogonReq,
         WebsocketStream, WebsocketStreams, create_stream_handler,
     };
-    use crate::config::{ConfigurationWebsocketApi, ConfigurationWebsocketStreams, PrivateKey};
+    use crate::config::{
+        ConfigurationWebsocketApi, ConfigurationWebsocketStreams, PrivateKey, RawFrameObserver,
+    };
     use crate::errors::{WebsocketConnectionFailureReason, WebsocketError};
     use crate::models::{StreamId, TimeUnit};
     use async_trait::async_trait;
+    use flate2::{Compression, write::ZlibEncoder};
     use futures::{SinkExt, StreamExt};
     use http::header::USER_AGENT;
     use regex::Regex;
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashSet};
+    use std::io::Write;
     use std::marker::PhantomData;
     use std::net::SocketAddr;
     use std::sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::net::TcpListener;
@@ -3030,6 +3078,96 @@ mod tests {
         fn drop(&mut self) {
             self.0.abort();
         }
+    }
+
+    struct RawOrderHandler {
+        raw_seen: Arc<AtomicBool>,
+        order: Arc<StdMutex<Vec<&'static str>>>,
+        messages: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl WebsocketHandler for RawOrderHandler {
+        async fn on_open(&self, _url: String, _connection: Arc<WebsocketConnection>) {}
+
+        async fn on_message(&self, data: String, _connection: Arc<WebsocketConnection>) {
+            assert!(
+                self.raw_seen.load(Ordering::SeqCst),
+                "raw observer must finish before the decode handler starts"
+            );
+            self.order.lock().unwrap().push("handler");
+            self.messages.lock().unwrap().push(data);
+        }
+
+        async fn get_reconnect_url(
+            &self,
+            default_url: String,
+            _connection: Arc<WebsocketConnection>,
+        ) -> String {
+            default_url
+        }
+    }
+
+    #[test]
+    fn raw_observer_runs_before_text_decode_and_binary_decompression() {
+        TOKIO_SHARED_RT.block_on(async {
+            let raw_seen = Arc::new(AtomicBool::new(false));
+            let order = Arc::new(StdMutex::new(Vec::new()));
+            let payloads = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+            let messages = Arc::new(StdMutex::new(Vec::<String>::new()));
+
+            let observer = {
+                let raw_seen = Arc::clone(&raw_seen);
+                let order = Arc::clone(&order);
+                let payloads = Arc::clone(&payloads);
+                RawFrameObserver::new(move |connection_id, payload| {
+                    assert_eq!(connection_id, "raw-order");
+                    payloads.lock().unwrap().push(payload.to_vec());
+                    order.lock().unwrap().push("raw");
+                    raw_seen.store(true, Ordering::SeqCst);
+                })
+            };
+            let connection = WebsocketConnection::new("raw-order");
+            connection
+                .set_handler(Arc::new(RawOrderHandler {
+                    raw_seen: Arc::clone(&raw_seen),
+                    order: Arc::clone(&order),
+                    messages: Arc::clone(&messages),
+                }))
+                .await;
+            let common = WebsocketCommon::new_with_raw_frame_observer(
+                vec![Arc::clone(&connection)],
+                WebsocketMode::Single,
+                0,
+                None,
+                None,
+                Some(observer),
+            );
+
+            let text = r#"{"e":"bookTicker"}"#;
+            common
+                .on_text_frame(text.to_string(), Arc::clone(&connection))
+                .await;
+            assert_eq!(&*order.lock().unwrap(), &["raw", "handler"]);
+            assert_eq!(&payloads.lock().unwrap()[0], text.as_bytes());
+
+            raw_seen.store(false, Ordering::SeqCst);
+            order.lock().unwrap().clear();
+            let binary_text = r#"{"e":"depthUpdate"}"#;
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(binary_text.as_bytes()).unwrap();
+            let compressed = encoder.finish().unwrap();
+            common
+                .on_binary_frame(&compressed, Arc::clone(&connection))
+                .await;
+
+            assert_eq!(&*order.lock().unwrap(), &["raw", "handler"]);
+            assert_eq!(&payloads.lock().unwrap()[1], &compressed);
+            assert_eq!(
+                &*messages.lock().unwrap(),
+                &[text.to_string(), binary_text.to_string()]
+            );
+        });
     }
 
     /// Spawn a mock WebSocket listener that accepts a single connection and
@@ -3130,6 +3268,7 @@ mod tests {
             mode: WebsocketMode::Single,
             reconnect_delay: 500,
             time_unit: None,
+            raw_frame_observer: None,
             agent: None,
             user_agent: build_user_agent("product"),
         };
@@ -4943,6 +5082,7 @@ mod tests {
                         reconnect_delay: 0,
                         agent: None,
                         user_agent: None,
+                        raw_frame_observer: None,
                     });
                     let url = format!("ws://{addr}");
                     let res = common
@@ -6959,6 +7099,7 @@ mod tests {
                         mode: WebsocketMode::Pool(2),
                         reconnect_delay: 500,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -6987,6 +7128,7 @@ mod tests {
                         mode: WebsocketMode::Pool(2),
                         reconnect_delay: 500,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7014,6 +7156,7 @@ mod tests {
                         mode: WebsocketMode::Pool(2),
                         reconnect_delay: 500,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7065,6 +7208,7 @@ mod tests {
                             mode: WebsocketMode::Pool(2),
                             reconnect_delay: 500,
                             time_unit: None,
+                            raw_frame_observer: None,
                             agent: None,
                             user_agent: build_user_agent("product"),
                         };
@@ -7099,6 +7243,7 @@ mod tests {
                         mode: WebsocketMode::Pool(2),
                         reconnect_delay: 500,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7135,6 +7280,7 @@ mod tests {
                         mode: WebsocketMode::Pool(2),
                         reconnect_delay: 500,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7742,6 +7888,7 @@ mod tests {
                         mode: WebsocketMode::Single,
                         reconnect_delay: 100,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7760,6 +7907,7 @@ mod tests {
                         mode: WebsocketMode::Single,
                         reconnect_delay: 100,
                         time_unit: Some(TimeUnit::Millisecond),
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7778,6 +7926,7 @@ mod tests {
                         mode: WebsocketMode::Single,
                         reconnect_delay: 100,
                         time_unit: Some(TimeUnit::Microsecond),
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7799,6 +7948,7 @@ mod tests {
                         mode: WebsocketMode::Single,
                         reconnect_delay: 100,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7817,6 +7967,7 @@ mod tests {
                         mode: WebsocketMode::Single,
                         reconnect_delay: 100,
                         time_unit: Some(TimeUnit::Millisecond),
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -7838,6 +7989,7 @@ mod tests {
                         mode: WebsocketMode::Single,
                         reconnect_delay: 100,
                         time_unit: None,
+                        raw_frame_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
