@@ -119,6 +119,12 @@ pub struct ConfigurationRestApi {
     #[builder(default = "3")]
     pub retries: u32,
 
+    /// Preserve HTTP status, Binance code/message, and response headers in a
+    /// single `ConnectorError::ApiError`. This is useful for trading clients
+    /// that must normalize venue errors without losing `Retry-After`.
+    #[builder(default = "false")]
+    pub preserve_error_response: bool,
+
     #[builder(default = "1000")]
     pub backoff: u64,
 
@@ -163,6 +169,7 @@ impl fmt::Debug for ConfigurationRestApi {
             .field("keep_alive", &self.keep_alive)
             .field("compression", &self.compression)
             .field("retries", &self.retries)
+            .field("preserve_error_response", &self.preserve_error_response)
             .field("backoff", &self.backoff)
             .field("proxy", &self.proxy)
             .field("custom_headers", &self.custom_headers)

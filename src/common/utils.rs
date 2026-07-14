@@ -519,7 +519,7 @@ pub fn build_query_string(params: &BTreeMap<String, Value>) -> Result<String, an
 }
 
 /// Determines whether a request should be retried based on:
-/// - HTTP method (only GET or DELETE are retriable)
+/// - HTTP method (only GET is retriable)
 /// - HTTP status (500, 502, 503, 504)
 /// - Number of retries left.
 ///
@@ -532,8 +532,7 @@ pub fn should_retry_request(
     retries_left: Option<usize>,
 ) -> bool {
     let method = method.unwrap_or("");
-    let is_retriable_method =
-        method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("DELETE");
+    let is_retriable_method = method.eq_ignore_ascii_case("GET");
 
     let status = error.status().map_or(0, |s| s.as_u16());
     let is_retriable_status = [500, 502, 503, 504].contains(&status);
@@ -667,8 +666,15 @@ pub async fn http_request<T: DeserializeOwned + Send + 'static>(
                     Ok(b) => b,
                     Err(e) => {
                         attempt += 1;
-                        if attempt <= retries {
+                        if req.method() == reqwest::Method::GET && attempt <= retries {
                             continue;
+                        }
+                        if configuration.preserve_error_response {
+                            return Err(ConnectorError::ResponseBodyError {
+                                status_code: status.as_u16(),
+                                msg: e.to_string(),
+                                headers: headers_map,
+                            });
                         }
                         return Err(ConnectorError::ConnectorClientError {
                             msg: format!("Failed to get response bytes: {e}"),
@@ -711,6 +717,15 @@ pub async fn http_request<T: DeserializeOwned + Send + 'static>(
                             err_msg = m.to_string();
                         }
                         err_code = v.get("code").and_then(serde_json::Value::as_i64);
+                    }
+
+                    if configuration.preserve_error_response {
+                        return Err(ConnectorError::ApiError {
+                            status_code: status.as_u16(),
+                            msg: err_msg,
+                            code: err_code,
+                            headers: headers_map,
+                        });
                     }
 
                     match status.as_u16() {
@@ -789,7 +804,11 @@ pub async fn http_request<T: DeserializeOwned + Send + 'static>(
             }
             Err(e) => {
                 attempt += 1;
-                if should_retry_request(&e, Some(req.method().as_str()), Some(retries - attempt)) {
+                if should_retry_request(
+                    &e,
+                    Some(req.method().as_str()),
+                    Some(retries.saturating_sub(attempt)),
+                ) {
                     delay(backoff * attempt as u64).await;
                     continue;
                 }
@@ -1980,12 +1999,11 @@ mod tests {
         fn retry_on_retriable_status_and_method() {
             let err = mk_http_error(500);
             assert!(should_retry_request(&err, Some("GET"), Some(1)));
-            assert!(should_retry_request(&err, Some("delete"), Some(2)));
         }
 
         #[test]
         fn retry_when_status_none_and_retriable_method() {
-            let retriable_methods = ["GET", "DELETE"];
+            let retriable_methods = ["GET"];
 
             for &method in &retriable_methods {
                 let err = mk_network_error();
@@ -2017,7 +2035,7 @@ mod tests {
 
         #[test]
         fn no_retry_on_non_retriable_method() {
-            let non_retriable_methods = ["POST", "PUT", "PATCH"];
+            let non_retriable_methods = ["POST", "PUT", "PATCH", "DELETE"];
 
             for &method in &non_retriable_methods {
                 let err = mk_http_error(500);
@@ -2030,7 +2048,7 @@ mod tests {
 
         #[test]
         fn no_retry_when_status_none_and_non_retriable_method() {
-            let non_retriable_methods = ["POST", "PUT"];
+            let non_retriable_methods = ["POST", "PUT", "DELETE"];
 
             for &method in &non_retriable_methods {
                 let err = mk_network_error();
@@ -2116,7 +2134,16 @@ mod tests {
     }
 
     mod http_request {
-        use std::io::Write;
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            thread,
+            time::{Duration, Instant},
+        };
 
         use flate2::{Compression, write::GzEncoder};
         use httpmock::MockServer;
@@ -2142,6 +2169,50 @@ mod tests {
                 .base_path(server_url)
                 .build()
                 .expect("Failed to build configuration")
+        }
+
+        fn make_preserving_config(server_url: &str, retries: u32) -> ConfigurationRestApi {
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server_url)
+                .retries(retries)
+                .preserve_error_response(true)
+                .build()
+                .expect("Failed to build preserving configuration")
+        }
+
+        fn start_truncated_body_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&requests);
+            let handle = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(400);
+                while Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(100)))
+                                .unwrap();
+                            let mut request = [0_u8; 4096];
+                            let _ = stream.read(&mut request);
+                            stream
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"foo\":\"cut",
+                                )
+                                .unwrap();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("test server accept failed: {error}"),
+                    }
+                }
+            });
+            (format!("http://{address}"), requests, handle)
         }
 
         #[test]
@@ -2504,6 +2575,121 @@ mod tests {
                 }
 
                 mock.assert();
+            });
+        }
+
+        #[test]
+        fn preserving_errors_keeps_status_code_message_and_retry_after() {
+            TOKIO_SHARED_RT.block_on(async {
+                let server = MockServer::start();
+                let bad_request = server.mock(|when, then| {
+                    when.method(httpmock::Method::POST).path("/400");
+                    then.status(400)
+                        .header("Content-Type", "application/json")
+                        .body(r#"{"code":-2010,"msg":"order rejected"}"#);
+                });
+                let rate_limited = server.mock(|when, then| {
+                    when.method(httpmock::Method::DELETE).path("/429");
+                    then.status(429)
+                        .header("Content-Type", "application/json")
+                        .header("Retry-After", "7")
+                        .body(r#"{"code":-1003,"msg":"too many requests"}"#);
+                });
+                let unknown_execution = server.mock(|when, then| {
+                    when.method(httpmock::Method::PUT).path("/503");
+                    then.status(503)
+                        .header("Content-Type", "application/json")
+                        .body(r#"{"code":-1007,"msg":"execution status unknown"}"#);
+                });
+                let unexpected_response = server.mock(|when, then| {
+                    when.method(httpmock::Method::POST).path("/500");
+                    then.status(500)
+                        .header("Content-Type", "application/json")
+                        .body(r#"{"code":-1006,"msg":"unexpected response"}"#);
+                });
+                let cfg = make_preserving_config(&server.url(""), 0);
+                let client = Client::new();
+
+                for (method, path, expected_status, expected_code, expected_message) in [
+                    (Method::POST, "/400", 400, -2010, "order rejected"),
+                    (Method::DELETE, "/429", 429, -1003, "too many requests"),
+                    (Method::PUT, "/503", 503, -1007, "execution status unknown"),
+                    (Method::POST, "/500", 500, -1006, "unexpected response"),
+                ] {
+                    let request = client
+                        .request(method, format!("{}{path}", server.url("")))
+                        .build()
+                        .unwrap();
+                    let Err(error) = http_request::<Dummy>(request, &cfg).await else {
+                        panic!("expected preserved API error");
+                    };
+                    let ConnectorError::ApiError {
+                        status_code,
+                        msg,
+                        code,
+                        headers,
+                    } = error
+                    else {
+                        panic!("expected preserved API error");
+                    };
+                    assert_eq!(status_code, expected_status);
+                    assert_eq!(code, Some(expected_code));
+                    assert_eq!(msg, expected_message);
+                    if expected_status == 429 {
+                        assert_eq!(headers.get("retry-after").map(String::as_str), Some("7"));
+                    }
+                }
+
+                bad_request.assert_hits(1);
+                rate_limited.assert_hits(1);
+                unknown_execution.assert_hits(1);
+                unexpected_response.assert_hits(1);
+            });
+        }
+
+        #[test]
+        fn state_changing_requests_never_retry_a_truncated_response_body() {
+            TOKIO_SHARED_RT.block_on(async {
+                for method in [Method::POST, Method::PUT, Method::DELETE] {
+                    let (base_url, requests, server) = start_truncated_body_server();
+                    let cfg = make_preserving_config(&base_url, 3);
+                    let request = Client::new()
+                        .request(method, format!("{base_url}/order"))
+                        .build()
+                        .unwrap();
+
+                    let Err(error) = http_request::<Dummy>(request, &cfg).await else {
+                        panic!("expected truncated body error");
+                    };
+                    assert!(matches!(
+                        error,
+                        ConnectorError::ResponseBodyError { .. }
+                            | ConnectorError::ConnectorClientError { .. }
+                    ));
+                    server.join().unwrap();
+                    assert_eq!(requests.load(Ordering::SeqCst), 1);
+                }
+            });
+        }
+
+        #[test]
+        fn zero_retries_does_not_underflow_after_a_network_error() {
+            TOKIO_SHARED_RT.block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                drop(listener);
+                let base_url = format!("http://{address}");
+                let cfg = make_preserving_config(&base_url, 0);
+                let request = Client::new()
+                    .request(Method::GET, format!("{base_url}/offline"))
+                    .build()
+                    .unwrap();
+
+                let result = http_request::<Dummy>(request, &cfg).await;
+                assert!(matches!(
+                    result,
+                    Err(ConnectorError::ConnectorClientError { .. })
+                ));
             });
         }
     }

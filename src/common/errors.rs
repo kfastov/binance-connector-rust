@@ -1,6 +1,8 @@
 use thiserror::Error;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 
+use std::collections::HashMap;
+
 /// Represents different types of WebSocket connection failures and their reconnection eligibility
 #[derive(Debug, Clone, Copy)]
 pub enum WebsocketConnectionFailureReason {
@@ -92,6 +94,27 @@ impl WebsocketConnectionFailureReason {
 
 #[derive(Error, Debug)]
 pub enum ConnectorError {
+    /// HTTP response returned by the API with its machine-readable payload and
+    /// headers preserved. Callers that normalize venue errors need the raw
+    /// status/code/message tuple and headers such as `Retry-After`.
+    #[error("API error {status_code}: {msg} (code: {code:?})")]
+    ApiError {
+        status_code: u16,
+        msg: String,
+        code: Option<i64>,
+        headers: HashMap<String, String>,
+    },
+
+    /// The server sent response headers but the response body could not be
+    /// read completely. For state-changing requests execution is unknown, so
+    /// the SDK preserves the response metadata and never retries internally.
+    #[error("Failed to read API response body (status code: {status_code}): {msg}")]
+    ResponseBodyError {
+        status_code: u16,
+        msg: String,
+        headers: HashMap<String, String>,
+    },
+
     #[error("Connector client error: {msg}")]
     ConnectorClientError { msg: String, code: Option<i64> },
 
