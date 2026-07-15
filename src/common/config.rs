@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio_tungstenite::Connector;
 
 use super::models::{ConfigBuildError, TimeUnit, WebsocketMode};
-use super::utils::{SignatureGenerator, build_client};
+use super::utils::{SignatureGenerator, build_client_with_redirects};
 
 #[derive(Clone)]
 pub struct AgentConnector(pub Connector);
@@ -116,6 +116,11 @@ pub struct ConfigurationRestApi {
     #[builder(default = "true")]
     pub compression: bool,
 
+    /// Whether the REST client follows HTTP redirects. Disable this for
+    /// state-changing signed requests to prevent replay at a redirect target.
+    #[builder(default = "true")]
+    pub follow_redirects: bool,
+
     #[builder(default = "3")]
     pub retries: u32,
 
@@ -168,6 +173,7 @@ impl fmt::Debug for ConfigurationRestApi {
             .field("timeout", &self.timeout)
             .field("keep_alive", &self.keep_alive)
             .field("compression", &self.compression)
+            .field("follow_redirects", &self.follow_redirects)
             .field("retries", &self.retries)
             .field("preserve_error_response", &self.preserve_error_response)
             .field("backoff", &self.backoff)
@@ -209,11 +215,12 @@ impl ConfigurationRestApiBuilder {
     /// Returns a `ConfigBuildError` if the initial configuration build fails or if client setup encounters issues.
     pub fn build(self) -> Result<ConfigurationRestApi, ConfigBuildError> {
         let mut cfg = self.try_build()?;
-        cfg.client = build_client(
+        cfg.client = build_client_with_redirects(
             cfg.timeout,
             cfg.keep_alive,
             cfg.proxy.as_ref(),
             cfg.agent.clone(),
+            cfg.follow_redirects,
         );
         cfg.signature_gen = SignatureGenerator::new(
             cfg.api_secret.clone(),

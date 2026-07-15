@@ -336,6 +336,16 @@ pub fn build_client(
     proxy: Option<&ProxyConfig>,
     agent: Option<HttpAgent>,
 ) -> Client {
+    build_client_with_redirects(timeout, keep_alive, proxy, agent, true)
+}
+
+pub(crate) fn build_client_with_redirects(
+    timeout: u64,
+    keep_alive: bool,
+    proxy: Option<&ProxyConfig>,
+    agent: Option<HttpAgent>,
+    follow_redirects: bool,
+) -> Client {
     let builder = Client::builder().timeout(Duration::from_millis(timeout));
 
     let mut builder = if keep_alive {
@@ -359,6 +369,10 @@ pub fn build_client(
 
     if let Some(HttpAgent(agent_fn)) = agent {
         builder = (agent_fn)(builder);
+    }
+
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
     }
 
     builder.build().expect("Failed to build reqwest client")
@@ -669,15 +683,16 @@ pub async fn http_request<T: DeserializeOwned + Send + 'static>(
                         if req.method() == reqwest::Method::GET && attempt <= retries {
                             continue;
                         }
+                        let error_message = e.without_url().to_string();
                         if configuration.preserve_error_response {
                             return Err(ConnectorError::ResponseBodyError {
                                 status_code: status.as_u16(),
-                                msg: e.to_string(),
+                                msg: error_message,
                                 headers: headers_map,
                             });
                         }
                         return Err(ConnectorError::ConnectorClientError {
-                            msg: format!("Failed to get response bytes: {e}"),
+                            msg: format!("Failed to get response bytes: {error_message}"),
                             code: None,
                         });
                     }
@@ -708,7 +723,9 @@ pub async fn http_request<T: DeserializeOwned + Send + 'static>(
 
                 let rate_limits = parse_rate_limit_headers(&headers_map);
 
-                if status.is_client_error() || status.is_server_error() {
+                let is_http_error = status.is_client_error() || status.is_server_error();
+                if is_http_error || (configuration.preserve_error_response && !status.is_success())
+                {
                     let mut err_msg = content.clone();
                     let mut err_code: Option<i64> = None;
 
@@ -812,8 +829,9 @@ pub async fn http_request<T: DeserializeOwned + Send + 'static>(
                     delay(backoff * attempt as u64).await;
                     continue;
                 }
+                let error_message = e.without_url();
                 return Err(ConnectorError::ConnectorClientError {
-                    msg: format!("HTTP request failed: {e}"),
+                    msg: format!("HTTP request failed: {error_message}"),
                     code: None,
                 });
             }
@@ -957,7 +975,7 @@ pub async fn send_request<T: DeserializeOwned + Send + 'static>(
         req_builder = req_builder.body(body_str);
     }
 
-    let req = req_builder.build()?;
+    let req = req_builder.build().map_err(reqwest::Error::without_url)?;
 
     Ok(http_request::<T>(req, configuration).await?)
 }
@@ -2182,6 +2200,17 @@ mod tests {
                 .expect("Failed to build preserving configuration")
         }
 
+        fn make_no_redirect_config(server_url: &str) -> ConfigurationRestApi {
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server_url)
+                .follow_redirects(false)
+                .preserve_error_response(true)
+                .build()
+                .expect("Failed to build configuration without redirects")
+        }
+
         fn start_truncated_body_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -2189,10 +2218,17 @@ mod tests {
             let requests = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&requests);
             let handle = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_millis(400);
-                while Instant::now() < deadline {
+                let startup_deadline = Instant::now() + Duration::from_secs(5);
+                let mut observation_deadline = None;
+                loop {
+                    let deadline = observation_deadline.unwrap_or(startup_deadline);
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            observation_deadline
+                                .get_or_insert_with(|| Instant::now() + Duration::from_millis(400));
                             observed.fetch_add(1, Ordering::SeqCst);
                             stream
                                 .set_read_timeout(Some(Duration::from_millis(100)))
@@ -2238,6 +2274,107 @@ mod tests {
                 let data = resp.data().await.unwrap();
                 assert_eq!(data, Dummy { foo: "bar".into() });
                 mock.assert();
+            });
+        }
+
+        #[test]
+        fn http_request_disabled_redirects_preserve_state_changing_responses_once() {
+            TOKIO_SHARED_RT.block_on(async {
+                for request_method in [Method::POST, Method::PUT, Method::DELETE] {
+                    for redirect_status in [307_u16, 308_u16] {
+                        let server = MockServer::start();
+                        let method_name = request_method.as_str().to_ascii_lowercase();
+                        let source_path = format!("/{method_name}/{redirect_status}");
+                        let target_path = format!("/{method_name}/{redirect_status}/target");
+                        let target_url = server.url(&target_path);
+                        let mock_method = match request_method {
+                            Method::POST => httpmock::Method::POST,
+                            Method::PUT => httpmock::Method::PUT,
+                            Method::DELETE => httpmock::Method::DELETE,
+                            _ => unreachable!("test method matrix is exhaustive"),
+                        };
+
+                        let source = server.mock(|when, then| {
+                            when.method(mock_method).path(source_path.as_str());
+                            then.status(redirect_status)
+                                .header("Location", target_url.as_str())
+                                .header("Content-Type", "application/json")
+                                .body(r#"{"foo":"redirect"}"#);
+                        });
+                        let target = server.mock(|when, then| {
+                            when.path(target_path.as_str());
+                            then.status(200)
+                                .header("Content-Type", "application/json")
+                                .body(r#"{"foo":"target"}"#);
+                        });
+
+                        let client = Client::new();
+                        let req = client
+                            .request(request_method.clone(), server.url(&source_path))
+                            .body("signed-command")
+                            .build()
+                            .unwrap();
+                        let cfg = make_no_redirect_config(&server.url(""));
+
+                        let Err(error) = http_request::<Dummy>(req, &cfg).await else {
+                            panic!("redirect response must not be reported as success");
+                        };
+                        match error {
+                            ConnectorError::ApiError {
+                                status_code,
+                                msg,
+                                code,
+                                headers,
+                            } => {
+                                assert_eq!(status_code, redirect_status);
+                                assert_eq!(msg, r#"{"foo":"redirect"}"#);
+                                assert_eq!(code, None);
+                                assert_eq!(headers.get("location"), Some(&target_url));
+                            }
+                            other => panic!("unexpected redirect error: {other:?}"),
+                        }
+                        source.assert_hits(1);
+                        target.assert_hits(0);
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn http_request_default_client_still_follows_get_redirects() {
+            TOKIO_SHARED_RT.block_on(async {
+                let server = MockServer::start();
+                let target_url = server.url("/target");
+                let source = server.mock(|when, then| {
+                    when.method(httpmock::Method::GET).path("/source");
+                    then.status(302).header("Location", target_url.as_str());
+                });
+                let target = server.mock(|when, then| {
+                    when.method(httpmock::Method::GET).path("/target");
+                    then.status(200)
+                        .header("Content-Type", "application/json")
+                        .body(r#"{"foo":"target"}"#);
+                });
+
+                let client = Client::new();
+                let req = client
+                    .request(Method::GET, server.url("/source"))
+                    .build()
+                    .unwrap();
+                let cfg = make_config(&server.url(""));
+                assert!(cfg.follow_redirects);
+
+                let response: RestApiResponse<Dummy> = http_request(req, &cfg).await.unwrap();
+                assert_eq!(response.status, 200);
+                let data = response.data().await.unwrap();
+                assert_eq!(
+                    data,
+                    Dummy {
+                        foo: "target".into()
+                    }
+                );
+                source.assert_hits(1);
+                target.assert_hits(1);
             });
         }
 
@@ -2650,25 +2787,66 @@ mod tests {
         #[test]
         fn state_changing_requests_never_retry_a_truncated_response_body() {
             TOKIO_SHARED_RT.block_on(async {
+                const CLIENT_ORDER_ID: &str = "run-secret-client-order-id";
                 for method in [Method::POST, Method::PUT, Method::DELETE] {
                     let (base_url, requests, server) = start_truncated_body_server();
                     let cfg = make_preserving_config(&base_url, 3);
                     let request = Client::new()
-                        .request(method, format!("{base_url}/order"))
+                        .request(
+                            method,
+                            format!(
+                                "{base_url}/order?signature=secret-signature&newClientOrderId={CLIENT_ORDER_ID}"
+                            ),
+                        )
                         .build()
                         .unwrap();
 
                     let Err(error) = http_request::<Dummy>(request, &cfg).await else {
                         panic!("expected truncated body error");
                     };
+                    let surfaced = error.to_string();
                     assert!(matches!(
                         error,
                         ConnectorError::ResponseBodyError { .. }
                             | ConnectorError::ConnectorClientError { .. }
                     ));
+                    assert!(!surfaced.contains("signature="));
+                    assert!(!surfaced.contains(CLIENT_ORDER_ID));
                     server.join().unwrap();
                     assert_eq!(requests.load(Ordering::SeqCst), 1);
                 }
+            });
+        }
+
+        #[test]
+        fn network_error_text_redacts_sensitive_request_url() {
+            TOKIO_SHARED_RT.block_on(async {
+                const CLIENT_ORDER_ID: &str = "run-secret-client-order-id";
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                drop(listener);
+                let base_url = format!("http://{address}");
+                let cfg = make_preserving_config(&base_url, 0);
+                let request = Client::new()
+                    .request(
+                        Method::POST,
+                        format!(
+                            "{base_url}/order?signature=secret-signature&newClientOrderId={CLIENT_ORDER_ID}"
+                        ),
+                    )
+                    .build()
+                    .unwrap();
+
+                let Err(error) = http_request::<Dummy>(request, &cfg).await else {
+                    panic!("expected network error");
+                };
+                let surfaced = error.to_string();
+                assert!(matches!(
+                    error,
+                    ConnectorError::ConnectorClientError { .. }
+                ));
+                assert!(!surfaced.contains("signature="));
+                assert!(!surfaced.contains(CLIENT_ORDER_ID));
             });
         }
 
