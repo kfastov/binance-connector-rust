@@ -26,13 +26,76 @@ impl fmt::Debug for HttpAgent {
     }
 }
 
-/// Synchronous observer for WebSocket data-frame payloads.
+/// Native WebSocket data-message kind presented to a context-aware raw observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawFrameKind {
+    Text,
+    Binary,
+}
+
+/// Borrowed metadata for one raw WebSocket data message.
 ///
-/// The observer runs in the reader task before any UTF-8/JSON handling or
-/// binary decompression. Keep callbacks non-blocking; a typical callback
-/// copies the payload into an application-owned ring buffer.
+/// `path_scope` is the SDK's generated endpoint scope (for example `market`,
+/// `public`, or `private`), never the full URL or query string. The payload is
+/// observed before generated JSON/deserialization handling and, for binary
+/// messages, before decompression. Text has already passed the WebSocket
+/// implementation's protocol and UTF-8 validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawFrameContext<'a> {
+    pub connection_id: &'a str,
+    /// Monotonic physical-session generation for this pool slot.
+    pub session_generation: u64,
+    pub path_scope: Option<&'a str>,
+    pub kind: RawFrameKind,
+    pub payload: &'a [u8],
+}
+
+/// Scoped WebSocket transport lifecycle transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebsocketLifecycleEvent {
+    Open,
+    Ping,
+    Pong,
+    Close { code: u16 },
+    ReadError,
+    WriteError,
+    ReconnectScheduled { is_renewal: bool },
+    StreamEnded,
+}
+
+/// Borrowed metadata for a WebSocket lifecycle transition.
+///
+/// No full URL or error text is exposed because private stream URLs can carry
+/// credentials. Consumers can correlate the stable connection id and the
+/// generated path scope without receiving secret-bearing transport strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebsocketLifecycleContext<'a> {
+    pub connection_id: &'a str,
+    /// Monotonic physical-session generation for this pool slot.
+    pub session_generation: u64,
+    pub path_scope: Option<&'a str>,
+    pub event: WebsocketLifecycleEvent,
+}
+
+type LegacyRawFrameObserver = dyn Fn(&str, &[u8]) + Send + Sync;
+type ContextRawFrameObserver = dyn for<'a> Fn(RawFrameContext<'a>) + Send + Sync;
+type LifecycleObserver = dyn for<'a> Fn(WebsocketLifecycleContext<'a>) + Send + Sync;
+
+/// Synchronous observer for WebSocket raw frames and scoped lifecycle events.
+///
+/// [`Self::new`] preserves the original data-frame-only callback. New
+/// integrations should use [`Self::new_context`] and optionally
+/// [`Self::with_lifecycle`] so one SDK instance can safely distinguish
+/// path-scoped connections, frame encoding, heartbeat, and reconnects.
+/// Keep callbacks non-blocking and non-panicking; a typical callback copies the
+/// borrowed data into an application-owned queue or ring buffer. Panics are
+/// caught at this SDK boundary so they cannot terminate transport actors.
 #[derive(Clone)]
-pub struct RawFrameObserver(pub Arc<dyn Fn(&str, &[u8]) + Send + Sync>);
+pub struct RawFrameObserver {
+    legacy: Option<Arc<LegacyRawFrameObserver>>,
+    context: Option<Arc<ContextRawFrameObserver>>,
+    lifecycle: Option<Arc<LifecycleObserver>>,
+}
 
 impl RawFrameObserver {
     #[must_use]
@@ -40,11 +103,76 @@ impl RawFrameObserver {
     where
         F: Fn(&str, &[u8]) + Send + Sync + 'static,
     {
-        Self(Arc::new(observer))
+        Self {
+            legacy: Some(Arc::new(observer)),
+            context: None,
+            lifecycle: None,
+        }
     }
 
-    pub(crate) fn observe(&self, connection_id: &str, payload: &[u8]) {
-        (self.0)(connection_id, payload);
+    /// Creates a path- and encoding-aware pre-decode observer.
+    #[must_use]
+    pub fn new_context<F>(observer: F) -> Self
+    where
+        F: for<'a> Fn(RawFrameContext<'a>) + Send + Sync + 'static,
+    {
+        Self {
+            legacy: None,
+            context: Some(Arc::new(observer)),
+            lifecycle: None,
+        }
+    }
+
+    /// Adds a scoped lifecycle observer to either raw-frame constructor.
+    #[must_use]
+    pub fn with_lifecycle<F>(mut self, observer: F) -> Self
+    where
+        F: for<'a> Fn(WebsocketLifecycleContext<'a>) + Send + Sync + 'static,
+    {
+        self.lifecycle = Some(Arc::new(observer));
+        self
+    }
+
+    pub(crate) fn observe_frame(&self, context: RawFrameContext<'_>) {
+        if let Some(observer) = &self.legacy {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(context.connection_id, context.payload);
+            }))
+            .is_err()
+            {
+                tracing::error!(
+                    "Raw WebSocket observer panicked on connection {}",
+                    context.connection_id
+                );
+            }
+        }
+        if let Some(observer) = &self.context {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(context);
+            }))
+            .is_err()
+            {
+                tracing::error!(
+                    "Context WebSocket observer panicked on connection {}",
+                    context.connection_id
+                );
+            }
+        }
+    }
+
+    pub(crate) fn observe_lifecycle(&self, context: WebsocketLifecycleContext<'_>) {
+        if let Some(observer) = &self.lifecycle {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(context);
+            }))
+            .is_err()
+            {
+                tracing::error!(
+                    "Lifecycle WebSocket observer panicked on connection {}",
+                    context.connection_id
+                );
+            }
+        }
     }
 }
 
