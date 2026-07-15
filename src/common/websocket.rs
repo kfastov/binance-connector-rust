@@ -458,10 +458,13 @@ impl WebsocketCommon {
                         );
                         continue;
                     }
+                    let reconnect_url = common
+                        .get_reconnect_url(&entry.url, Arc::clone(&conn_arc))
+                        .await;
                     let common_clone = Arc::clone(&common);
                     if common_clone
                         .init_connect(
-                            &entry.url,
+                            &reconnect_url,
                             entry.is_renewal,
                             Some(conn_arc.clone()),
                             Some(entry.session_generation),
@@ -472,7 +475,7 @@ impl WebsocketCommon {
                         error!(
                             "Reconnect failed for {} → {}",
                             entry.connection_id,
-                            redacted_websocket_url(&entry.url)
+                            redacted_websocket_url(&reconnect_url)
                         );
                     }
 
@@ -2626,9 +2629,9 @@ impl WebsocketStreams {
     /// # Behavior
     ///
     /// - Validates the request identifier or generates a random one
-    /// - Checks for active connections and subscribed streams
-    /// - Sends unsubscribe payload for streams with active callbacks
-    /// - Removes stream from connection streams and callbacks
+    /// - Checks for subscribed streams and active callbacks
+    /// - Sends an unsubscribe payload when the associated connection is active
+    /// - Removes stream ownership from local state even when the connection is inactive
     ///
     /// # Side Effects
     ///
@@ -2656,62 +2659,65 @@ impl WebsocketStreams {
 
         for stream in streams {
             let key = self.stream_key(&stream, url_path);
-            let maybe_conn = { self.connection_streams.lock().await.get(&key).cloned() };
-
-            let conn = match maybe_conn {
-                Some(c) => {
-                    if !self.common.is_connected(Some(&c)).await {
-                        warn!("Subscription is not associated with an active connection");
-                        continue;
-                    }
-                    c
-                }
-                None => {
+            let (conn, was_connected) = {
+                let mut connection_streams = self.connection_streams.lock().await;
+                let Some(conn) = connection_streams.get(&key).cloned() else {
                     warn!("Requested subscription was not present");
                     continue;
-                }
-            };
-
-            let has_callbacks = {
-                let conn_state = conn.state.lock().await;
-                conn_state
+                };
+                let mut conn_state = conn.state.lock().await;
+                let has_callbacks = conn_state
                     .stream_callbacks
                     .get(&key)
-                    .is_some_and(|v| !v.is_empty())
+                    .is_some_and(|v| !v.is_empty());
+
+                if has_callbacks {
+                    continue;
+                }
+
+                let was_connected = conn_state.ws_write_tx.is_some()
+                    && !conn_state.reconnection_pending
+                    && !conn_state.close_initiated;
+                conn_state.stream_callbacks.remove(&key);
+                conn_state
+                    .pending_subscriptions
+                    .retain(|pending| pending != &stream);
+                if connection_streams
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &conn))
+                {
+                    connection_streams.remove(&key);
+                }
+                drop(conn_state);
+                drop(connection_streams);
+                (conn, was_connected)
             };
 
-            if has_callbacks {
-                continue;
-            }
+            if was_connected {
+                let payload = json!({
+                    "method": "UNSUBSCRIBE",
+                    "params": [stream.clone()],
+                    "id": request_id,
+                });
 
-            let payload = json!({
-                "method": "UNSUBSCRIBE",
-                "params": [stream.clone()],
-                "id": request_id,
-            });
+                info!(
+                    "UNSUBSCRIBE one stream on connection {} for scope {}",
+                    conn.id,
+                    redacted_path_scope(url_path)
+                );
 
-            info!(
-                "UNSUBSCRIBE one stream on connection {} for scope {}",
-                conn.id,
-                redacted_path_scope(url_path)
-            );
-
-            let common = Arc::clone(&self.common);
-            let conn_clone = Arc::clone(&conn);
-            let msg = serde_json::to_string(&payload).unwrap();
-            spawn(async move {
-                let _ = common
-                    .send(msg, None, false, Duration::ZERO, Some(conn_clone))
-                    .await;
-            });
-
-            {
-                let mut connection_streams = self.connection_streams.lock().await;
-                connection_streams.remove(&key);
-            }
-            {
-                let mut conn_state = conn.state.lock().await;
-                conn_state.stream_callbacks.remove(&key);
+                let common = Arc::clone(&self.common);
+                let conn_clone = Arc::clone(&conn);
+                let msg = serde_json::to_string(&payload).unwrap();
+                spawn(async move {
+                    let _ = common
+                        .send(msg, None, false, Duration::ZERO, Some(conn_clone))
+                        .await;
+                });
+            } else {
+                warn!(
+                    "Subscription is not associated with an active connection; releasing local state"
+                );
             }
         }
     }
@@ -3210,17 +3216,17 @@ where
     /// Panics if the stream is not subscribed to
     ///
     /// # Notes
-    /// - If no callback is present, no action is taken
-    /// - Spawns an asynchronous task to handle the unsubscription process
+    /// - Stream subscriptions are released even when no typed callback was registered
+    /// - Local subscription state is released before this method returns
     pub async fn unsubscribe(&self) {
         let maybe_cb = {
             let mut guard = self.callback.lock().await;
             guard.take()
         };
 
-        if let Some(cb) = maybe_cb {
-            match &self.websocket_base {
-                WebsocketBase::WebsocketStreams(ws_streams) => {
+        match &self.websocket_base {
+            WebsocketBase::WebsocketStreams(ws_streams) => {
+                if let Some(cb) = maybe_cb {
                     let key = ws_streams.stream_key(&self.stream_or_id, self.url_path.as_deref());
                     let conn = {
                         let map = ws_streams.connection_streams.lock().await;
@@ -3235,18 +3241,18 @@ where
                             list.retain(|existing| !Arc::ptr_eq(existing, &cb));
                         }
                     }
-
-                    let stream = self.stream_or_id.clone();
-                    let id = self.id.clone();
-                    let url_path = self.url_path.clone();
-                    let websocket_streams_base = Arc::clone(ws_streams);
-                    spawn(async move {
-                        websocket_streams_base
-                            .unsubscribe(vec![stream], id, url_path.as_deref())
-                            .await;
-                    });
                 }
-                WebsocketBase::WebsocketApi(ws_api) => {
+
+                ws_streams
+                    .unsubscribe(
+                        vec![self.stream_or_id.clone()],
+                        self.id.clone(),
+                        self.url_path.as_deref(),
+                    )
+                    .await;
+            }
+            WebsocketBase::WebsocketApi(ws_api) => {
+                if let Some(cb) = maybe_cb {
                     let mut stream_callbacks = ws_api.stream_callbacks.lock().await;
                     if let Some(list) = stream_callbacks.get_mut(&self.stream_or_id) {
                         list.retain(|existing| !Arc::ptr_eq(existing, &cb));
@@ -4039,6 +4045,23 @@ mod tests {
         mod spawn_reconnect_loop {
             use super::*;
 
+            struct ReplacementReconnectUrl(String);
+
+            #[async_trait]
+            impl WebsocketHandler for ReplacementReconnectUrl {
+                async fn on_open(&self, _url: String, _connection: Arc<WebsocketConnection>) {}
+
+                async fn on_message(&self, _data: String, _connection: Arc<WebsocketConnection>) {}
+
+                async fn get_reconnect_url(
+                    &self,
+                    _default_url: String,
+                    _connection: Arc<WebsocketConnection>,
+                ) -> String {
+                    self.0.clone()
+                }
+            }
+
             #[test]
             fn successful_reconnect_entry_triggers_init_connect() {
                 TOKIO_SHARED_RT.block_on(async {
@@ -4082,6 +4105,48 @@ mod tests {
                         sleep(Duration::from_millis(50)).await;
                     }
                     assert!(ok, "expected ws_write_tx to be Some after reconnect");
+                });
+            }
+
+            #[test]
+            fn reconnect_recomputes_url_immediately_before_attempt() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let _listener_guard = spawn_mock_ws_listener(listener);
+
+                    let conn = WebsocketConnection::new("recompute-url");
+                    conn.set_handler(Arc::new(ReplacementReconnectUrl(format!(
+                        "ws://{addr}/current"
+                    ))))
+                    .await;
+                    let common = WebsocketCommon::new(
+                        vec![conn.clone()],
+                        WebsocketMode::Single,
+                        0,
+                        None,
+                        None,
+                    );
+                    common
+                        .reconnect_tx
+                        .send(ReconnectEntry {
+                            connection_id: conn.id.clone(),
+                            session_generation: 0,
+                            path_scope: Some("private".to_string()),
+                            url: "ws://127.0.0.1:1/stale-listen-key".to_string(),
+                            is_renewal: false,
+                        })
+                        .await
+                        .unwrap();
+
+                    assert!(
+                        eventually_async(Duration::from_secs(1), || {
+                            let conn = Arc::clone(&conn);
+                            async move { conn.state.lock().await.ws_write_tx.is_some() }
+                        })
+                        .await,
+                        "reconnect attempt did not use the handler's current URL"
+                    );
                 });
             }
 
@@ -8476,22 +8541,47 @@ mod tests {
             }
 
             #[test]
-            fn removes_even_without_write_channel() {
+            fn removes_disconnected_pending_subscription_without_sending() {
                 TOKIO_SHARED_RT.block_on(async {
                     let ws = create_websocket_streams(None, None, None);
                     let conn = ws.common.connection_pool[0].clone();
+                    let stream = "old-listen-key".to_string();
+                    let keep_stream = "keep-key".to_string();
+                    let url_path = "private";
+                    let key = ws.stream_key(&stream, Some(url_path));
                     {
                         let mut map = ws.connection_streams.lock().await;
-                        map.insert("x".to_string(), conn.clone());
+                        map.insert(key.clone(), conn.clone());
                     }
-                    {
+                    let mut rx = {
+                        let (tx, rx) = unbounded_channel();
                         let mut state = conn.state.lock().await;
-                        let (tx, _rx) = unbounded_channel();
                         state.ws_write_tx = Some(tx);
-                        state.stream_callbacks.insert("x".to_string(), Vec::new());
-                    }
-                    ws.unsubscribe(vec!["x".into()], None, None).await;
-                    assert!(!ws.connection_streams.lock().await.contains_key("x"));
+                        state.reconnection_pending = true;
+                        state.url_path = Some(url_path.to_string());
+                        state.stream_callbacks.insert(key.clone(), Vec::new());
+                        state.pending_subscriptions.push_back(stream.clone());
+                        state.pending_subscriptions.push_back(keep_stream.clone());
+                        rx
+                    };
+
+                    ws.unsubscribe(vec![stream.clone()], None, Some(url_path))
+                        .await;
+
+                    assert!(!ws.connection_streams.lock().await.contains_key(&key));
+                    let state = conn.state.lock().await;
+                    assert!(!state.stream_callbacks.contains_key(&key));
+                    assert!(!state.pending_subscriptions.contains(&stream));
+                    assert!(state.pending_subscriptions.contains(&keep_stream));
+                    drop(state);
+                    assert!(timeout(Duration::from_millis(20), rx.recv()).await.is_err());
+                    let reconnect_url = ws
+                        .get_reconnect_url(
+                            "wss://example/private/stream?streams=old-listen-key".to_string(),
+                            conn,
+                        )
+                        .await;
+                    assert!(!reconnect_url.contains("old-listen-key"));
                 });
             }
 
@@ -10167,29 +10257,51 @@ mod tests {
             use super::*;
 
             #[test]
-            fn without_callback_does_nothing() {
+            fn without_callback_releases_stream_subscription() {
                 TOKIO_SHARED_RT.block_on(async {
                     let ws_base = create_websocket_streams(Some("example.com"), None, None);
                     let stream_name = "s1".to_string();
+                    let url_path = "private";
+                    let key = ws_base.stream_key(&stream_name, Some(url_path));
                     let conn = ws_base.common.connection_pool[0].clone();
+                    let mut rx = {
+                        let (tx, rx) = unbounded_channel::<Message>();
+                        let mut state = conn.state.lock().await;
+                        state.ws_write_tx = Some(tx);
+                        state.url_path = Some(url_path.to_string());
+                        rx
+                    };
                     {
                         let mut map = ws_base.connection_streams.lock().await;
-                        map.insert(stream_name.clone(), conn.clone());
+                        map.insert(key.clone(), conn.clone());
                     }
                     let mut state = conn.state.lock().await;
-                    state.stream_callbacks.insert(stream_name.clone(), vec![]);
+                    state.stream_callbacks.insert(key.clone(), vec![]);
                     drop(state);
                     let stream = Arc::new(WebsocketStream::<Value> {
                         websocket_base: WebsocketBase::WebsocketStreams(ws_base.clone()),
                         stream_or_id: stream_name.clone(),
-                        url_path: None,
+                        url_path: Some(url_path.to_string()),
                         callback: Mutex::new(None),
                         id: None,
                         _phantom: PhantomData,
                     });
                     stream.unsubscribe().await;
+
+                    let message = timeout(Duration::from_millis(200), rx.recv())
+                        .await
+                        .expect("timed out waiting for UNSUBSCRIBE")
+                        .expect("write channel closed before UNSUBSCRIBE");
+                    let Message::Text(text) = message else {
+                        panic!("expected text UNSUBSCRIBE payload");
+                    };
+                    let payload: Value = serde_json::from_str(text.as_ref()).unwrap();
+                    assert_eq!(payload["method"], "UNSUBSCRIBE");
+                    assert_eq!(payload["params"], json!([stream_name]));
+
+                    assert!(!ws_base.connection_streams.lock().await.contains_key(&key));
                     let state = conn.state.lock().await;
-                    assert!(state.stream_callbacks.contains_key(&stream_name));
+                    assert!(!state.stream_callbacks.contains_key(&key));
                 });
             }
 
