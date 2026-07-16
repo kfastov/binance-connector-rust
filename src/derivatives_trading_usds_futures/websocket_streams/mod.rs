@@ -13,15 +13,21 @@
 
 #![allow(unused_imports)]
 use serde_json::Value;
-use std::sync::{Arc, atomic::Ordering};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 use tokio::spawn;
 
 use crate::common::config::ConfigurationWebsocketStreams;
+use crate::common::errors::StreamSubscriptionError;
 use crate::common::websocket::{
     Subscription, WebsocketBase, WebsocketStream, WebsocketStreams as WebsocketStreamsBase,
-    create_stream_handler,
+    create_stream_handler, create_stream_handler_confirmed,
 };
-use crate::models::{StreamId, WebsocketEvent, WebsocketMode};
+use crate::models::{
+    StreamId, StreamSubscriptionAck, StreamSubscriptionEvent, WebsocketEvent, WebsocketMode,
+};
 
 mod apis;
 mod handle;
@@ -32,6 +38,7 @@ pub use handle::*;
 pub use models::*;
 
 const HAS_TIME_UNIT: bool = false;
+const USER_DATA_SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebsocketStreams {
     websocket_streams_base: Arc<WebsocketStreamsBase>,
@@ -83,6 +90,13 @@ impl WebsocketStreams {
     ///
     /// A `Subscription` that can be used to manage the event subscription.
     ///
+    /// # Security
+    ///
+    /// [`WebsocketEvent::Message`] is an explicit raw-frame escape hatch and
+    /// can contain private listen keys or server text that repeats them. Do not
+    /// log it verbatim. Use [`Self::subscribe_on_stream_subscription_events`]
+    /// for redacted subscription lifecycle diagnostics.
+    ///
     /// # Examples
     ///
     ///
@@ -114,6 +128,19 @@ impl WebsocketStreams {
     ///
     pub fn unsubscribe_from_ws_events(&self, subscription: Subscription) {
         subscription.unsubscribe();
+    }
+
+    /// Subscribes to correlated JSON stream-subscription outcomes for
+    /// diagnostics. Delivery is asynchronous and is not an ordered ingress
+    /// gate relative to raw frames. Configure a synchronous
+    /// [`crate::common::config::StreamSubscriptionObserver`] for that purpose.
+    /// Events never contain stream parameters or listen keys.
+    pub fn subscribe_on_stream_subscription_events<F>(&self, callback: F) -> Subscription
+    where
+        F: FnMut(StreamSubscriptionEvent) + Send + 'static,
+    {
+        self.websocket_streams_base
+            .subscribe_on_stream_subscription_events(callback)
     }
 
     /// Disconnects the WebSocket connection.
@@ -263,13 +290,53 @@ impl WebsocketStreams {
         listen_key: String,
         id: Option<String>,
     ) -> anyhow::Result<Arc<WebsocketStream<UserDataStreamEventsResponse>>> {
-        Ok(create_stream_handler::<UserDataStreamEventsResponse>(
+        // Keep the generated source-level signature while complying with the
+        // venue's unsigned-INT requirement. Decimal u32 strings are preserved;
+        // UUID/hex or otherwise invalid legacy IDs are replaced by an unsigned
+        // allocator value rather than sent as unsupported JSON strings.
+        let request_id = id
+            .as_deref()
+            .and_then(|id| id.parse::<u32>().ok())
+            .unwrap_or_else(|| self.websocket_streams_base.next_stream_request_id());
+        let (stream, _) = self
+            .user_data_confirmed(listen_key, request_id, USER_DATA_SUBSCRIPTION_ACK_TIMEOUT)
+            .await
+            .map_err(anyhow::Error::new)?;
+        Ok(stream)
+    }
+
+    /// Subscribes to all events for one listen key and returns only after the
+    /// exact numeric request has been acknowledged on the physical session
+    /// identified by the returned context.
+    ///
+    /// The current Binance notice does not define the selected-events JSON item
+    /// schema. This method therefore preserves the generated SDK's established
+    /// all-events form, `params: [listen_key]`, and does not invent an extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted [`StreamSubscriptionError`] when the numeric request
+    /// cannot be dispatched or exactly acknowledged on its physical session.
+    pub async fn user_data_confirmed(
+        &self,
+        listen_key: String,
+        request_id: u32,
+        ack_timeout: Duration,
+    ) -> Result<
+        (
+            Arc<WebsocketStream<UserDataStreamEventsResponse>>,
+            StreamSubscriptionAck,
+        ),
+        StreamSubscriptionError,
+    > {
+        create_stream_handler_confirmed::<UserDataStreamEventsResponse>(
             WebsocketBase::WebsocketStreams(self.websocket_streams_base.clone()),
             listen_key,
-            id.map(StreamId::from),
+            request_id,
+            ack_timeout,
             Some("private".to_string()),
         )
-        .await)
+        .await
     }
 
     /// Aggregate Trade Streams

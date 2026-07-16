@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 use tokio_tungstenite::Connector;
 
-use super::models::{ConfigBuildError, TimeUnit, WebsocketMode};
+use super::models::{ConfigBuildError, StreamSubscriptionEvent, TimeUnit, WebsocketMode};
 use super::utils::{SignatureGenerator, build_client_with_redirects};
 
 #[derive(Clone)]
@@ -36,7 +36,8 @@ pub enum RawFrameKind {
 /// Borrowed metadata for one raw WebSocket data message.
 ///
 /// `path_scope` is the SDK's generated endpoint scope (for example `market`,
-/// `public`, or `private`), never the full URL or query string. The payload is
+/// `public`, or `private`); arbitrary internal values are reported as `other`,
+/// never as the full URL or query string. The payload is
 /// observed before generated JSON/deserialization handling and, for binary
 /// messages, before decompression. Text has already passed the WebSocket
 /// implementation's protocol and UTF-8 validation.
@@ -68,6 +69,7 @@ pub enum WebsocketLifecycleEvent {
 /// No full URL or error text is exposed because private stream URLs can carry
 /// credentials. Consumers can correlate the stable connection id and the
 /// generated path scope without receiving secret-bearing transport strings.
+/// Arbitrary internal values are collapsed to `other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebsocketLifecycleContext<'a> {
     pub connection_id: &'a str,
@@ -179,6 +181,47 @@ impl RawFrameObserver {
 impl fmt::Debug for RawFrameObserver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "RawFrameObserver(<custom observer fn>)")
+    }
+}
+
+type StreamSubscriptionObserverFn = dyn Fn(&StreamSubscriptionEvent) + Send + Sync;
+
+/// Synchronous, redacted observer for one stream-subscription lifecycle.
+///
+/// The callback runs inline at the transport boundary to preserve causal
+/// ordering with raw frames. Keep it non-blocking. Panics are caught so an
+/// application observer cannot terminate WebSocket transport actors.
+#[derive(Clone)]
+pub struct StreamSubscriptionObserver(Arc<StreamSubscriptionObserverFn>);
+
+impl StreamSubscriptionObserver {
+    #[must_use]
+    pub fn new<F>(observer: F) -> Self
+    where
+        F: Fn(&StreamSubscriptionEvent) + Send + Sync + 'static,
+    {
+        Self(Arc::new(observer))
+    }
+
+    pub(crate) fn observe(&self, event: &StreamSubscriptionEvent) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.0)(event);
+        }))
+        .is_err()
+        {
+            tracing::error!(
+                "Stream subscription observer panicked on connection {} generation {} request {}",
+                event.context.connection_id,
+                event.context.session_generation,
+                event.context.request_id
+            );
+        }
+    }
+}
+
+impl fmt::Debug for StreamSubscriptionObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StreamSubscriptionObserver(<custom observer fn>)")
     }
 }
 
@@ -500,6 +543,10 @@ pub struct ConfigurationWebsocketStreams {
     /// Optional synchronous hook for raw Text/Binary payloads before decode.
     #[builder(setter(strip_option), default)]
     pub raw_frame_observer: Option<RawFrameObserver>,
+
+    /// Optional synchronous, redacted stream-subscription lifecycle hook.
+    #[builder(setter(strip_option), default)]
+    pub stream_subscription_observer: Option<StreamSubscriptionObserver>,
 
     #[builder(setter(skip))]
     pub(crate) user_agent: String,

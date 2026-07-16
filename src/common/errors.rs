@@ -3,6 +3,8 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 
 use std::collections::HashMap;
 
+use super::models::StreamSubscriptionContext;
+
 /// Represents different types of WebSocket connection failures and their reconnection eligibility
 #[derive(Debug, Clone, Copy)]
 pub enum WebsocketConnectionFailureReason {
@@ -166,4 +168,34 @@ pub enum WebsocketError {
     NoResponse,
     #[error("Server‐side response error (code {code}): {message}")]
     ResponseError { code: i64, message: String },
+}
+
+/// Fail-closed errors for JSON stream subscription confirmation. The error
+/// surface deliberately omits stream parameters and server messages because a
+/// private stream parameter can contain a listen key.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum StreamSubscriptionError {
+    #[error("stream subscription is already desired (request {request_id})")]
+    AlreadyDesired { request_id: u32 },
+    #[error("no WebSocket connection is available (request {request_id})")]
+    NoConnection { request_id: u32 },
+    #[error("stream subscription transport is not connected: {context:?}")]
+    NotConnected { context: StreamSubscriptionContext },
+    #[error("stream subscription request id was already used on this session: {context:?}")]
+    DuplicateRequestId { context: StreamSubscriptionContext },
+    #[error("stream subscription was rejected with code {code}: {context:?}")]
+    Rejected {
+        context: StreamSubscriptionContext,
+        code: i64,
+    },
+    #[error("stream subscription timed out: {context:?}")]
+    Timeout { context: StreamSubscriptionContext },
+    #[error("stream subscription response violated the protocol: {context:?}")]
+    Protocol { context: StreamSubscriptionContext },
+    #[error("stream subscription session was replaced: {context:?}")]
+    SessionReplaced { context: StreamSubscriptionContext },
+    #[error("stream subscription transport disconnected: {context:?}")]
+    Disconnected { context: StreamSubscriptionContext },
+    #[error("stream subscription response channel closed: {context:?}")]
+    ResponseChannelClosed { context: StreamSubscriptionContext },
 }

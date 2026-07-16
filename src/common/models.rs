@@ -181,6 +181,8 @@ impl From<UninitializedFieldError> for ConfigBuildError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WebsocketEvent {
     Open,
+    /// Raw server frame. It may contain credentials such as private listen
+    /// keys; treat it as secret-bearing data and never log it verbatim.
     Message(String),
     Error(String),
     Close(u16, String),
@@ -219,6 +221,64 @@ pub struct WebsocketStreamsConnectConfig {
 pub enum StreamId {
     Str(String),
     Number(u32),
+}
+
+/// Secret-free generated endpoint scope for a stream-subscription request.
+///
+/// Arbitrary internal path strings are collapsed to [`Self::Other`] so a
+/// caller-controlled path, query, or credential can never enter diagnostic
+/// contexts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamSubscriptionScope {
+    Default,
+    Market,
+    Public,
+    Private,
+    Stream,
+    Ws,
+    WsApi,
+    Other,
+}
+
+/// Identifies one JSON stream-subscription request on one physical WebSocket
+/// session. It intentionally contains no stream name: private stream names may
+/// contain a listen key and must not leak through diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSubscriptionContext {
+    pub connection_id: String,
+    pub session_generation: u64,
+    pub request_id: u32,
+    /// Closed, redacted generated endpoint scope; never an arbitrary path,
+    /// query string, stream parameter, or full URL.
+    pub path_scope: StreamSubscriptionScope,
+}
+
+/// Result observed for a correlated JSON stream-subscription request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamSubscriptionOutcome {
+    Dispatched,
+    Acknowledged,
+    Rejected { code: i64 },
+    TimedOut,
+    DispatchFailed,
+    ProtocolError,
+    SessionReplaced,
+    Disconnected,
+    Cancelled,
+}
+
+/// Low-level stream-subscription lifecycle event. Stream parameters are never
+/// included because a private stream parameter can be a listen key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSubscriptionEvent {
+    pub context: StreamSubscriptionContext,
+    pub outcome: StreamSubscriptionOutcome,
+}
+
+/// Successful, server-confirmed JSON stream subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamSubscriptionAck {
+    pub context: StreamSubscriptionContext,
 }
 
 impl From<String> for StreamId {

@@ -5,13 +5,13 @@ use http::header::USER_AGENT;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     io::Read,
     marker::PhantomData,
     mem::take,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -40,16 +40,25 @@ use tracing::{debug, error, info, warn};
 use super::{
     config::{
         AgentConnector, ConfigurationWebsocketApi, ConfigurationWebsocketStreams, RawFrameContext,
-        RawFrameKind, RawFrameObserver, WebsocketLifecycleContext, WebsocketLifecycleEvent,
+        RawFrameKind, RawFrameObserver, StreamSubscriptionObserver, WebsocketLifecycleContext,
+        WebsocketLifecycleEvent,
     },
-    errors::{WebsocketConnectionFailureReason, WebsocketError},
-    models::{StreamId, WebsocketApiResponse, WebsocketEvent, WebsocketMode},
-    utils::{build_websocket_api_message, normalize_stream_id, random_string, validate_time_unit},
+    errors::{StreamSubscriptionError, WebsocketConnectionFailureReason, WebsocketError},
+    models::{
+        StreamId, StreamSubscriptionAck, StreamSubscriptionContext, StreamSubscriptionEvent,
+        StreamSubscriptionOutcome, StreamSubscriptionScope, WebsocketApiResponse, WebsocketEvent,
+        WebsocketMode,
+    },
+    utils::{
+        build_websocket_api_message, normalize_stream_id, random_integer, random_string,
+        validate_time_unit,
+    },
 };
 
 pub type WebSocketClient = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const MAX_CONN_DURATION: Duration = Duration::from_secs(23 * 60 * 60);
+const STREAM_SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn redacted_websocket_url(raw: &str) -> String {
     let Ok(parsed) = url::Url::parse(raw) else {
@@ -81,16 +90,42 @@ fn redacted_websocket_url(raw: &str) -> String {
     }
 }
 
-fn redacted_path_scope(scope: Option<&str>) -> &'static str {
+fn stream_subscription_scope(scope: Option<&str>) -> StreamSubscriptionScope {
     match scope {
-        Some("market") => "market",
-        Some("public") => "public",
-        Some("private") => "private",
-        Some("stream") => "stream",
-        Some("ws") => "ws",
-        Some("ws-api") => "ws-api",
-        Some(_) => "other",
-        None => "default",
+        Some("market") => StreamSubscriptionScope::Market,
+        Some("public") => StreamSubscriptionScope::Public,
+        Some("private") => StreamSubscriptionScope::Private,
+        Some("stream") => StreamSubscriptionScope::Stream,
+        Some("ws") => StreamSubscriptionScope::Ws,
+        Some("ws-api") => StreamSubscriptionScope::WsApi,
+        Some(_) => StreamSubscriptionScope::Other,
+        None => StreamSubscriptionScope::Default,
+    }
+}
+
+fn observer_path_scope(scope: Option<&str>) -> Option<&'static str> {
+    match stream_subscription_scope(scope) {
+        StreamSubscriptionScope::Default => None,
+        StreamSubscriptionScope::Market => Some("market"),
+        StreamSubscriptionScope::Public => Some("public"),
+        StreamSubscriptionScope::Private => Some("private"),
+        StreamSubscriptionScope::Stream => Some("stream"),
+        StreamSubscriptionScope::Ws => Some("ws"),
+        StreamSubscriptionScope::WsApi => Some("ws-api"),
+        StreamSubscriptionScope::Other => Some("other"),
+    }
+}
+
+fn redacted_path_scope(scope: Option<&str>) -> &'static str {
+    match stream_subscription_scope(scope) {
+        StreamSubscriptionScope::Default => "default",
+        StreamSubscriptionScope::Market => "market",
+        StreamSubscriptionScope::Public => "public",
+        StreamSubscriptionScope::Private => "private",
+        StreamSubscriptionScope::Stream => "stream",
+        StreamSubscriptionScope::Ws => "ws",
+        StreamSubscriptionScope::WsApi => "ws-api",
+        StreamSubscriptionScope::Other => "other",
     }
 }
 
@@ -126,6 +161,135 @@ pub enum WebsocketBase {
 
 pub struct WebsocketEventEmitter {
     subscribers: Arc<std::sync::Mutex<Vec<UnboundedSender<WebsocketEvent>>>>,
+}
+
+#[derive(Clone)]
+struct StreamSubscriptionEventEmitter {
+    subscribers: Arc<std::sync::Mutex<Vec<UnboundedSender<StreamSubscriptionEvent>>>>,
+    synchronous: Option<StreamSubscriptionObserver>,
+}
+
+impl StreamSubscriptionEventEmitter {
+    fn new(synchronous: Option<StreamSubscriptionObserver>) -> Self {
+        Self {
+            subscribers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            synchronous,
+        }
+    }
+
+    fn subscribe<F>(&self, mut callback: F) -> Subscription
+    where
+        F: FnMut(StreamSubscriptionEvent) + Send + 'static,
+    {
+        let (tx, mut rx) = unbounded_channel();
+        let mut guard = match self.subscribers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(tx);
+        drop(guard);
+
+        let handle = spawn(async move {
+            while let Some(event) = rx.recv().await {
+                callback(event);
+            }
+        });
+        Subscription { handle }
+    }
+
+    fn emit(&self, event: &StreamSubscriptionEvent) {
+        if let Some(observer) = &self.synchronous {
+            observer.observe(event);
+        }
+        let mut guard = match self.subscribers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+}
+
+struct StreamSubscriptionLifecycle {
+    context: std::sync::Mutex<Option<StreamSubscriptionContext>>,
+    dispatched: AtomicBool,
+    terminal_emitted: AtomicBool,
+}
+
+impl StreamSubscriptionLifecycle {
+    fn new() -> Self {
+        Self {
+            context: std::sync::Mutex::new(None),
+            dispatched: AtomicBool::new(false),
+            terminal_emitted: AtomicBool::new(false),
+        }
+    }
+
+    fn set_context(&self, context: StreamSubscriptionContext) {
+        let mut stored = match self.context.lock() {
+            Ok(stored) => stored,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *stored = Some(context);
+    }
+
+    fn context(&self) -> Option<StreamSubscriptionContext> {
+        let stored = match self.context.lock() {
+            Ok(stored) => stored,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        stored.clone()
+    }
+
+    fn emit_dispatched(
+        &self,
+        emitter: &StreamSubscriptionEventEmitter,
+        context: &StreamSubscriptionContext,
+    ) {
+        self.dispatched.store(true, Ordering::Release);
+        emitter.emit(&StreamSubscriptionEvent {
+            context: context.clone(),
+            outcome: StreamSubscriptionOutcome::Dispatched,
+        });
+    }
+
+    fn emit_terminal(
+        &self,
+        emitter: &StreamSubscriptionEventEmitter,
+        context: StreamSubscriptionContext,
+        outcome: StreamSubscriptionOutcome,
+    ) -> bool {
+        if !self.try_claim_terminal() {
+            return false;
+        }
+        Self::emit_claimed(emitter, context, outcome);
+        true
+    }
+
+    fn try_claim_terminal(&self) -> bool {
+        self.terminal_emitted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn emit_claimed(
+        emitter: &StreamSubscriptionEventEmitter,
+        context: StreamSubscriptionContext,
+        outcome: StreamSubscriptionOutcome,
+    ) {
+        emitter.emit(&StreamSubscriptionEvent { context, outcome });
+    }
+
+    fn claim_cancelled_if_dispatched(&self) -> Option<StreamSubscriptionContext> {
+        if !self.dispatched.load(Ordering::Acquire) {
+            return None;
+        }
+        let context = self.context()?;
+        if self.try_claim_terminal() {
+            Some(context)
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for WebsocketEventEmitter {
@@ -232,6 +396,17 @@ impl WebsocketEventEmitter {
 pub trait WebsocketHandler: Send + Sync + 'static {
     async fn on_open(&self, url: String, connection: Arc<WebsocketConnection>);
     async fn on_message(&self, data: String, connection: Arc<WebsocketConnection>);
+    /// Context-aware message hook. The default preserves compatibility with
+    /// existing handlers; stream handlers override it when a response must be
+    /// correlated to one physical session generation.
+    async fn on_message_with_session(
+        &self,
+        data: String,
+        connection: Arc<WebsocketConnection>,
+        _session_generation: u64,
+    ) {
+        self.on_message(data, connection).await;
+    }
     async fn get_reconnect_url(
         &self,
         default_url: String,
@@ -241,6 +416,16 @@ pub trait WebsocketHandler: Send + Sync + 'static {
 
 pub struct PendingRequest {
     pub completion: oneshot::Sender<Result<Value, WebsocketError>>,
+}
+
+struct PendingStreamSubscription {
+    token: u64,
+    context: StreamSubscriptionContext,
+    stream_keys: Vec<String>,
+    was_confirmed: bool,
+    unconfirmed_reservation_token: Option<u64>,
+    lifecycle: Arc<StreamSubscriptionLifecycle>,
+    completion: oneshot::Sender<Result<StreamSubscriptionAck, StreamSubscriptionError>>,
 }
 
 #[derive(Clone)]
@@ -255,13 +440,18 @@ pub struct WebsocketConnectionState {
     pub renewal_pending: bool,
     pub close_initiated: bool,
     pub pending_requests: HashMap<String, PendingRequest>,
+    pending_stream_subscriptions: HashMap<u32, PendingStreamSubscription>,
+    stream_request_id_generations: HashMap<u32, u64>,
     pub pending_subscriptions: VecDeque<String>,
     pub stream_callbacks: HashMap<String, Vec<Arc<dyn Fn(&Value) + Send + Sync + 'static>>>,
+    confirmed_stream_keys: BTreeSet<String>,
+    unconfirmed_stream_reservations: HashMap<String, u64>,
     pub is_session_logged_on: bool,
     pub session_logon_req: Option<WebsocketSessionLogonReq>,
     pub url_path: Option<String>,
     pub handler: Option<Arc<dyn WebsocketHandler>>,
     pub ws_write_tx: Option<UnboundedSender<Message>>,
+    writer_session_generation: Option<u64>,
 }
 
 impl Default for WebsocketConnectionState {
@@ -278,14 +468,34 @@ impl WebsocketConnectionState {
             renewal_pending: false,
             close_initiated: false,
             pending_requests: HashMap::new(),
+            pending_stream_subscriptions: HashMap::new(),
+            stream_request_id_generations: HashMap::new(),
             pending_subscriptions: VecDeque::new(),
             stream_callbacks: HashMap::new(),
+            confirmed_stream_keys: BTreeSet::new(),
+            unconfirmed_stream_reservations: HashMap::new(),
             is_session_logged_on: false,
             session_logon_req: None,
             url_path: None,
             handler: None,
             ws_write_tx: None,
+            writer_session_generation: None,
         }
+    }
+
+    fn remove_pending_stream_subscription(
+        &mut self,
+        request_id: u32,
+        claim_terminal: bool,
+    ) -> Option<(PendingStreamSubscription, bool)> {
+        let terminal_claimed = claim_terminal
+            && self
+                .pending_stream_subscriptions
+                .get(&request_id)
+                .is_some_and(|pending| pending.lifecycle.try_claim_terminal());
+        self.pending_stream_subscriptions
+            .remove(&request_id)
+            .map(|pending| (pending, terminal_claimed))
     }
 }
 
@@ -858,11 +1068,23 @@ impl WebsocketCommon {
     ///
     /// - If a connection handler exists, awaits its `on_message` method
     /// - Emits a `WebsocketEvent::Message` event with the received message
+    #[cfg(test)]
     async fn on_message(&self, msg: String, connection: Arc<WebsocketConnection>) {
+        let session_generation = connection.session_generation.load(Ordering::Acquire);
+        self.on_message_for_session(msg, connection, session_generation)
+            .await;
+    }
+
+    async fn on_message_for_session(
+        &self,
+        msg: String,
+        connection: Arc<WebsocketConnection>,
+        session_generation: u64,
+    ) {
         let handler = connection.state.lock().await.handler.clone();
         if let Some(handler) = handler {
             handler
-                .on_message(msg.clone(), Arc::clone(&connection))
+                .on_message_with_session(msg.clone(), Arc::clone(&connection), session_generation)
                 .await;
         }
         self.events.emit(&WebsocketEvent::Message(msg));
@@ -879,6 +1101,7 @@ impl WebsocketCommon {
         path_scope: Option<&str>,
     ) {
         if let Some(observer) = &self.raw_frame_observer {
+            let path_scope = observer_path_scope(path_scope);
             observer.observe_frame(RawFrameContext {
                 connection_id: &connection.id,
                 session_generation,
@@ -887,7 +1110,8 @@ impl WebsocketCommon {
                 payload: msg.as_bytes(),
             });
         }
-        self.on_message(msg, connection).await;
+        self.on_message_for_session(msg, connection, session_generation)
+            .await;
     }
 
     /// Observes compressed bytes before decompression, then dispatches the
@@ -900,6 +1124,7 @@ impl WebsocketCommon {
         path_scope: Option<&str>,
     ) {
         if let Some(observer) = &self.raw_frame_observer {
+            let path_scope = observer_path_scope(path_scope);
             observer.observe_frame(RawFrameContext {
                 connection_id: &connection.id,
                 session_generation,
@@ -915,7 +1140,8 @@ impl WebsocketCommon {
             error!("Binary message decompress failed: {:?}", err);
             return;
         }
-        self.on_message(decompressed, connection).await;
+        self.on_message_for_session(decompressed, connection, session_generation)
+            .await;
     }
 
     fn observe_lifecycle(
@@ -926,6 +1152,7 @@ impl WebsocketCommon {
         event: WebsocketLifecycleEvent,
     ) {
         if let Some(observer) = &self.raw_frame_observer {
+            let path_scope = observer_path_scope(path_scope);
             observer.observe_lifecycle(WebsocketLifecycleContext {
                 connection_id,
                 session_generation,
@@ -1154,6 +1381,8 @@ impl WebsocketCommon {
         let old_writer = {
             let mut conn_state = conn.state.lock().await;
             conn_state.reconnection_pending = false;
+            conn_state.writer_session_generation = Some(session_generation);
+            conn_state.stream_request_id_generations.clear();
             conn_state.ws_write_tx.replace(tx.clone())
         };
 
@@ -1205,6 +1434,7 @@ impl WebsocketCommon {
                             conn_state.reconnection_pending = true;
                             conn_state.is_session_logged_on = false;
                             conn_state.ws_write_tx = None;
+                            conn_state.writer_session_generation = None;
                             drop(conn_state);
                             let reconnect_url = common_clone
                                 .get_reconnect_url(&writer_url, Arc::clone(&wconn))
@@ -1337,6 +1567,7 @@ impl WebsocketCommon {
                                 conn_state.reconnection_pending = true;
                                 conn_state.is_session_logged_on = false;
                                 conn_state.ws_write_tx = None;
+                                conn_state.writer_session_generation = None;
                                 drop(conn_state);
                                 let reconnect_url = common
                                     .get_reconnect_url(&read_url, Arc::clone(&reader_conn))
@@ -1409,6 +1640,7 @@ impl WebsocketCommon {
                                 conn_state.reconnection_pending = true;
                                 conn_state.is_session_logged_on = false;
                                 conn_state.ws_write_tx = None;
+                                conn_state.writer_session_generation = None;
                                 drop(conn_state);
                                 let reconnect_url = common
                                     .get_reconnect_url(&read_url, Arc::clone(&reader_conn))
@@ -1482,6 +1714,7 @@ impl WebsocketCommon {
                     conn_state.reconnection_pending = true;
                     conn_state.is_session_logged_on = false;
                     conn_state.ws_write_tx = None;
+                    conn_state.writer_session_generation = None;
                     drop(conn_state);
                     let reconnect_url = common
                         .get_reconnect_url(&read_url, Arc::clone(&reader_conn))
@@ -2356,10 +2589,181 @@ impl WebsocketHandler for WebsocketApi {
 pub struct WebsocketStreams {
     pub common: Arc<WebsocketCommon>,
     pub stream_id_is_strictly_number: AtomicBool,
+    next_stream_request_id: AtomicU32,
+    next_stream_pending_token: AtomicU64,
+    next_stream_reservation_token: AtomicU64,
+    stream_subscription_events: StreamSubscriptionEventEmitter,
     url_paths: Vec<String>,
     is_connecting: Mutex<bool>,
-    connection_streams: Mutex<HashMap<String, Arc<WebsocketConnection>>>,
+    connection_streams: Arc<Mutex<HashMap<String, Arc<WebsocketConnection>>>>,
     configuration: ConfigurationWebsocketStreams,
+}
+
+async fn release_unconfirmed_stream_keys(
+    connection_streams: Arc<Mutex<HashMap<String, Arc<WebsocketConnection>>>>,
+    connection: Arc<WebsocketConnection>,
+    stream_keys: &[String],
+    reservation_token: u64,
+) {
+    let mut assignments = connection_streams.lock().await;
+    let mut state = connection.state.lock().await;
+    let path_scope = state.url_path.clone();
+    let mut released_keys = Vec::new();
+
+    for key in stream_keys {
+        let owned_here = assignments
+            .get(key)
+            .is_some_and(|assigned| Arc::ptr_eq(assigned, &connection));
+        let owns_reservation = state
+            .unconfirmed_stream_reservations
+            .get(key)
+            .is_some_and(|current| *current == reservation_token);
+        if owned_here && owns_reservation {
+            state.stream_callbacks.remove(key);
+            state.confirmed_stream_keys.remove(key);
+            state.unconfirmed_stream_reservations.remove(key);
+            assignments.remove(key);
+            released_keys.push(key.clone());
+        }
+    }
+
+    state.pending_subscriptions.retain(|stream| {
+        let key = match path_scope.as_deref() {
+            Some(path) if !path.is_empty() => format!("{path}::{stream}"),
+            _ => stream.clone(),
+        };
+        !released_keys.contains(&key)
+    });
+}
+
+fn spawn_stream_terminal_owner(
+    connection_streams: Arc<Mutex<HashMap<String, Arc<WebsocketConnection>>>>,
+    connection: Arc<WebsocketConnection>,
+    stream_keys: Vec<String>,
+    reservation_token: Option<u64>,
+    events: StreamSubscriptionEventEmitter,
+    context: StreamSubscriptionContext,
+    outcome: StreamSubscriptionOutcome,
+    terminal_claimed: bool,
+) -> JoinHandle<()> {
+    spawn(async move {
+        if let Some(reservation_token) = reservation_token {
+            release_unconfirmed_stream_keys(
+                connection_streams,
+                connection,
+                &stream_keys,
+                reservation_token,
+            )
+            .await;
+        }
+        if terminal_claimed {
+            StreamSubscriptionLifecycle::emit_claimed(&events, context, outcome);
+        }
+    })
+}
+
+async fn finish_stream_terminal(
+    connection_streams: Arc<Mutex<HashMap<String, Arc<WebsocketConnection>>>>,
+    connection: Arc<WebsocketConnection>,
+    stream_keys: Vec<String>,
+    reservation_token: Option<u64>,
+    events: StreamSubscriptionEventEmitter,
+    context: StreamSubscriptionContext,
+    outcome: StreamSubscriptionOutcome,
+    terminal_claimed: bool,
+) {
+    let connection_id = context.connection_id.clone();
+    let request_id = context.request_id;
+    if let Err(join_error) = spawn_stream_terminal_owner(
+        connection_streams,
+        connection,
+        stream_keys,
+        reservation_token,
+        events,
+        context,
+        outcome,
+        terminal_claimed,
+    )
+    .await
+    {
+        error!(
+            "Stream subscription terminal owner failed on connection {} request {}: {}",
+            connection_id, request_id, join_error
+        );
+    }
+}
+
+struct UnconfirmedAssignmentGuard {
+    connection_streams: Arc<Mutex<HashMap<String, Arc<WebsocketConnection>>>>,
+    connection: Arc<WebsocketConnection>,
+    stream_keys: Vec<String>,
+    request_id: u32,
+    reservation_token: u64,
+    lifecycle: Arc<StreamSubscriptionLifecycle>,
+    events: StreamSubscriptionEventEmitter,
+    armed: bool,
+}
+
+impl UnconfirmedAssignmentGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnconfirmedAssignmentGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let connection_streams = Arc::clone(&self.connection_streams);
+        let connection = Arc::clone(&self.connection);
+        let stream_keys = self.stream_keys.clone();
+        let request_id = self.request_id;
+        let reservation_token = self.reservation_token;
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let events = self.events.clone();
+        runtime.spawn(async move {
+            let (removed_pending, cancelled_context) = {
+                let mut state = connection.state.lock().await;
+                let owns_pending = state
+                    .pending_stream_subscriptions
+                    .get(&request_id)
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.lifecycle, &lifecycle));
+                if owns_pending {
+                    let (pending, terminal_claimed) = state
+                        .remove_pending_stream_subscription(request_id, true)
+                        .expect("lifecycle-matched pending subscription must still exist");
+                    let context = terminal_claimed.then(|| pending.context.clone());
+                    (Some(pending), context)
+                } else {
+                    (None, lifecycle.claim_cancelled_if_dispatched())
+                }
+            };
+            let (stream_keys, reservation_token) = removed_pending.map_or_else(
+                || (stream_keys, Some(reservation_token)),
+                |pending| (pending.stream_keys, pending.unconfirmed_reservation_token),
+            );
+            if let Some(reservation_token) = reservation_token {
+                release_unconfirmed_stream_keys(
+                    connection_streams,
+                    connection,
+                    &stream_keys,
+                    reservation_token,
+                )
+                .await;
+            }
+            if let Some(context) = cancelled_context {
+                StreamSubscriptionLifecycle::emit_claimed(
+                    &events,
+                    context,
+                    StreamSubscriptionOutcome::Cancelled,
+                );
+            }
+        });
+    }
 }
 
 impl WebsocketStreams {
@@ -2395,6 +2799,7 @@ impl WebsocketStreams {
 
         let agent_clone = configuration.agent.clone();
         let user_agent_clone = configuration.user_agent.clone();
+        let stream_subscription_observer = configuration.stream_subscription_observer.clone();
         let common = WebsocketCommon::new_with_raw_frame_observer(
             connection_pool,
             configuration.mode.clone(),
@@ -2407,9 +2812,15 @@ impl WebsocketStreams {
         Arc::new(Self {
             common,
             is_connecting: Mutex::new(false),
-            connection_streams: Mutex::new(HashMap::new()),
+            connection_streams: Arc::new(Mutex::new(HashMap::new())),
             configuration,
             stream_id_is_strictly_number: AtomicBool::new(false),
+            next_stream_request_id: AtomicU32::new(random_integer()),
+            next_stream_pending_token: AtomicU64::new(1),
+            next_stream_reservation_token: AtomicU64::new(1),
+            stream_subscription_events: StreamSubscriptionEventEmitter::new(
+                stream_subscription_observer,
+            ),
             url_paths,
         })
     }
@@ -2525,13 +2936,67 @@ impl WebsocketStreams {
     /// - Clears pending subscriptions for all connections
     /// - Removes all connection stream mappings
     pub async fn disconnect(&self) -> Result<(), WebsocketError> {
-        for connection in &self.common.connection_pool {
-            let mut conn_state = connection.state.lock().await;
-            conn_state.stream_callbacks.clear();
-            conn_state.pending_subscriptions.clear();
+        let common = Arc::clone(&self.common);
+        let connections = self.common.connection_pool.clone();
+        let connection_streams = Arc::clone(&self.connection_streams);
+        let terminal_events_emitter = self.stream_subscription_events.clone();
+        match spawn(async move {
+            let disconnect_result = common.disconnect().await;
+            let mut terminal_events = Vec::new();
+            for connection in connections {
+                let pending = {
+                    let mut conn_state = connection.state.lock().await;
+                    // Also cover slots which had no active writer when the
+                    // common transport shutdown began. No new subscription
+                    // may enter after this drain and escape Disconnected.
+                    conn_state.close_initiated = true;
+                    let pending_ids = conn_state
+                        .pending_stream_subscriptions
+                        .keys()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let pending = pending_ids
+                        .into_iter()
+                        .filter_map(|request_id| {
+                            conn_state.remove_pending_stream_subscription(request_id, true)
+                        })
+                        .collect::<Vec<_>>();
+                    conn_state.stream_callbacks.clear();
+                    conn_state.pending_subscriptions.clear();
+                    conn_state.confirmed_stream_keys.clear();
+                    conn_state.unconfirmed_stream_reservations.clear();
+                    conn_state.stream_request_id_generations.clear();
+                    pending
+                };
+                for (pending, terminal_claimed) in pending {
+                    let context = pending.context.clone();
+                    if terminal_claimed {
+                        terminal_events.push(context.clone());
+                    }
+                    let error = StreamSubscriptionError::Disconnected { context };
+                    let _ = pending.completion.send(Err(error));
+                }
+            }
+            connection_streams.lock().await.clear();
+            for context in terminal_events {
+                StreamSubscriptionLifecycle::emit_claimed(
+                    &terminal_events_emitter,
+                    context,
+                    StreamSubscriptionOutcome::Disconnected,
+                );
+            }
+            disconnect_result
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_error) => {
+                error!("Stream disconnect terminal owner failed: {}", join_error);
+                Err(WebsocketError::ServerError(format!(
+                    "stream disconnect terminal owner failed: {join_error}"
+                )))
+            }
         }
-        self.connection_streams.lock().await.clear();
-        self.common.disconnect().await
     }
 
     /// Checks if the WebSocket connection is currently active.
@@ -2553,6 +3018,24 @@ impl WebsocketStreams {
     /// Sends a ping request to the WebSocket server through the common connection.
     pub async fn ping_server(&self) {
         self.common.ping_server().await;
+    }
+
+    /// Subscribes to correlated JSON stream-subscription outcomes for
+    /// diagnostics. Delivery is asynchronous and must not be used as an
+    /// ordered ingress gate relative to raw frames. Configure a synchronous
+    /// [`StreamSubscriptionObserver`] for that purpose. Events carry only
+    /// redacted connection/session/scope/request context.
+    pub fn subscribe_on_stream_subscription_events<F>(&self, callback: F) -> Subscription
+    where
+        F: FnMut(StreamSubscriptionEvent) + Send + 'static,
+    {
+        self.stream_subscription_events.subscribe(callback)
+    }
+
+    /// Allocates an unsigned JSON request identifier for stream control.
+    #[must_use]
+    pub fn next_stream_request_id(&self) -> u32 {
+        self.next_stream_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Subscribes to multiple WebSocket streams, handling connection and queuing logic.
@@ -2618,6 +3101,334 @@ impl WebsocketStreams {
         }
     }
 
+    /// Subscribes one stream and resolves only after an ACK, a correlated
+    /// reject, or a local timeout for the exact physical session used to send
+    /// the request. No stream parameter is included in the result or error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted [`StreamSubscriptionError`] when assignment,
+    /// dispatch, acknowledgement, or session correlation fails.
+    pub async fn subscribe_one_confirmed(
+        self: Arc<Self>,
+        stream: String,
+        request_id: u32,
+        ack_timeout: Duration,
+        url_path: Option<&str>,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        let key = self.stream_key(&stream, url_path);
+        let (connection, reservation_token) = self
+            .reserve_one_stream_assignment(&key, request_id, url_path)
+            .await?;
+        let lifecycle = Arc::new(StreamSubscriptionLifecycle::new());
+
+        let mut ownership_guard = UnconfirmedAssignmentGuard {
+            connection_streams: Arc::clone(&self.connection_streams),
+            connection: connection.clone(),
+            stream_keys: vec![key.clone()],
+            request_id,
+            reservation_token,
+            lifecycle: lifecycle.clone(),
+            events: self.stream_subscription_events.clone(),
+            armed: true,
+        };
+
+        let result = self
+            .send_subscription_payload_confirmed(
+                &connection,
+                std::slice::from_ref(&stream),
+                request_id,
+                ack_timeout,
+                Some(reservation_token),
+                lifecycle.clone(),
+            )
+            .await;
+
+        let ack = match result {
+            Ok(ack) => ack,
+            Err(error) => {
+                self.release_stream_assignment(&key, &stream, &connection, reservation_token)
+                    .await;
+                ownership_guard.disarm();
+                return Err(error);
+            }
+        };
+
+        let mut connection_streams = self.connection_streams.lock().await;
+        let owns_assignment = connection_streams
+            .get(&key)
+            .is_some_and(|assigned| Arc::ptr_eq(assigned, &connection));
+        let mut state = connection.state.lock().await;
+        let owns_reservation = state
+            .unconfirmed_stream_reservations
+            .get(&key)
+            .is_some_and(|current| *current == reservation_token);
+        let current_generation = state.writer_session_generation;
+        if !owns_assignment
+            || !owns_reservation
+            || current_generation != Some(ack.context.session_generation)
+        {
+            if owns_assignment && owns_reservation {
+                state.stream_callbacks.remove(&key);
+                state.confirmed_stream_keys.remove(&key);
+                state.unconfirmed_stream_reservations.remove(&key);
+                connection_streams.remove(&key);
+            }
+            ownership_guard.disarm();
+            drop(state);
+            drop(connection_streams);
+            lifecycle.emit_terminal(
+                &self.stream_subscription_events,
+                ack.context.clone(),
+                StreamSubscriptionOutcome::SessionReplaced,
+            );
+            return Err(StreamSubscriptionError::SessionReplaced {
+                context: ack.context,
+            });
+        }
+        state.unconfirmed_stream_reservations.remove(&key);
+        state.confirmed_stream_keys.insert(key);
+        ownership_guard.disarm();
+        drop(state);
+        drop(connection_streams);
+        lifecycle.emit_terminal(
+            &self.stream_subscription_events,
+            ack.context.clone(),
+            StreamSubscriptionOutcome::Acknowledged,
+        );
+        Ok(ack)
+    }
+
+    async fn reserve_one_stream_assignment(
+        &self,
+        key: &str,
+        request_id: u32,
+        url_path: Option<&str>,
+    ) -> Result<(Arc<WebsocketConnection>, u64), StreamSubscriptionError> {
+        let connection = self
+            .common
+            .get_connection(true, url_path)
+            .await
+            .map_err(|_| StreamSubscriptionError::NoConnection { request_id })?;
+        let reservation_token = self
+            .next_stream_reservation_token
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut assignments = self.connection_streams.lock().await;
+        if assignments.contains_key(key) {
+            return Err(StreamSubscriptionError::AlreadyDesired { request_id });
+        }
+
+        let mut state = connection.state.lock().await;
+        state.stream_callbacks.entry(key.to_string()).or_default();
+        state
+            .unconfirmed_stream_reservations
+            .insert(key.to_string(), reservation_token);
+        assignments.insert(key.to_string(), connection.clone());
+        drop(state);
+        drop(assignments);
+        Ok((connection, reservation_token))
+    }
+
+    async fn release_stream_assignment(
+        &self,
+        key: &str,
+        stream: &str,
+        connection: &Arc<WebsocketConnection>,
+        reservation_token: u64,
+    ) {
+        let mut connection_streams = self.connection_streams.lock().await;
+        if !connection_streams
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, connection))
+        {
+            return;
+        }
+
+        let mut state = connection.state.lock().await;
+        let owns_reservation = state
+            .unconfirmed_stream_reservations
+            .get(key)
+            .is_some_and(|current| *current == reservation_token);
+        if !owns_reservation {
+            return;
+        }
+        state.stream_callbacks.remove(key);
+        state
+            .pending_subscriptions
+            .retain(|pending| pending != stream);
+        state.confirmed_stream_keys.remove(key);
+        state.unconfirmed_stream_reservations.remove(key);
+        connection_streams.remove(key);
+    }
+
+    async fn send_subscription_payload_confirmed(
+        &self,
+        connection: &Arc<WebsocketConnection>,
+        streams: &[String],
+        request_id: u32,
+        ack_timeout: Duration,
+        unconfirmed_reservation_token: Option<u64>,
+        lifecycle: Arc<StreamSubscriptionLifecycle>,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        let mut state = connection.state.lock().await;
+        let session_generation = state
+            .writer_session_generation
+            .unwrap_or_else(|| connection.session_generation.load(Ordering::Acquire));
+        let context = StreamSubscriptionContext {
+            connection_id: connection.id.clone(),
+            session_generation,
+            request_id,
+            path_scope: stream_subscription_scope(state.url_path.as_deref()),
+        };
+        lifecycle.set_context(context.clone());
+        let payload = json!({
+            "method": "SUBSCRIBE",
+            "params": streams,
+            "id": request_id,
+        });
+        let Ok(message) = serde_json::to_string(&payload) else {
+            return Err(StreamSubscriptionError::Protocol { context });
+        };
+
+        if state.pending_stream_subscriptions.contains_key(&request_id)
+            || state
+                .stream_request_id_generations
+                .get(&request_id)
+                .is_some_and(|used_generation| *used_generation == session_generation)
+        {
+            return Err(StreamSubscriptionError::DuplicateRequestId { context });
+        }
+
+        let token = self
+            .next_stream_pending_token
+            .fetch_add(1, Ordering::Relaxed);
+        let (completion, receiver) = oneshot::channel();
+        let stream_keys = streams
+            .iter()
+            .map(|stream| self.stream_key(stream, state.url_path.as_deref()))
+            .collect::<Vec<_>>();
+        let was_confirmed = stream_keys
+            .iter()
+            .all(|key| state.confirmed_stream_keys.contains(key));
+        let owns_unconfirmed_reservation = unconfirmed_reservation_token.is_some_and(|token| {
+            stream_keys.iter().all(|key| {
+                state
+                    .unconfirmed_stream_reservations
+                    .get(key)
+                    .is_some_and(|current| *current == token)
+            })
+        });
+        if !was_confirmed && !owns_unconfirmed_reservation {
+            return Err(StreamSubscriptionError::SessionReplaced { context });
+        }
+        state.pending_stream_subscriptions.insert(
+            request_id,
+            PendingStreamSubscription {
+                token,
+                context: context.clone(),
+                stream_keys: stream_keys.clone(),
+                was_confirmed,
+                unconfirmed_reservation_token,
+                lifecycle: lifecycle.clone(),
+                completion,
+            },
+        );
+        state
+            .stream_request_id_generations
+            .insert(request_id, session_generation);
+        lifecycle.emit_dispatched(&self.stream_subscription_events, &context);
+        let writer = state.ws_write_tx.clone().filter(|_| {
+            state.writer_session_generation == Some(session_generation)
+                && !state.reconnection_pending
+                && !state.close_initiated
+        });
+        let dispatch_failed =
+            writer.is_none_or(|writer| writer.send(Message::Text(message.into())).is_err());
+
+        if dispatch_failed {
+            let (pending, terminal_claimed) = state
+                .remove_pending_stream_subscription(request_id, true)
+                .expect("just-inserted subscription request must still be pending");
+            if state.stream_request_id_generations.get(&request_id) == Some(&session_generation) {
+                state.stream_request_id_generations.remove(&request_id);
+            }
+            drop(state);
+            finish_stream_terminal(
+                Arc::clone(&self.connection_streams),
+                connection.clone(),
+                pending.stream_keys,
+                pending.unconfirmed_reservation_token,
+                self.stream_subscription_events.clone(),
+                context.clone(),
+                StreamSubscriptionOutcome::DispatchFailed,
+                terminal_claimed,
+            )
+            .await;
+            return Err(StreamSubscriptionError::NotConnected { context });
+        }
+        let path_scope = state.url_path.clone();
+        drop(state);
+
+        info!(
+            "SUBSCRIBE {} stream(s) on connection {} generation {} for scope {} with request id {}",
+            streams.len(),
+            connection.id,
+            session_generation,
+            redacted_path_scope(path_scope.as_deref()),
+            request_id
+        );
+
+        let timeout_connection = Arc::clone(connection);
+        let timeout_assignments = Arc::clone(&self.connection_streams);
+        let timeout_context = context.clone();
+        let timeout_events = self.stream_subscription_events.clone();
+        spawn(async move {
+            sleep(ack_timeout).await;
+            let timed_out = {
+                let mut state = timeout_connection.state.lock().await;
+                let matches_token = state
+                    .pending_stream_subscriptions
+                    .get(&request_id)
+                    .is_some_and(|pending| pending.token == token);
+                if matches_token {
+                    state.remove_pending_stream_subscription(request_id, true)
+                } else {
+                    None
+                }
+            };
+            if let Some((pending, terminal_claimed)) = timed_out {
+                let error = StreamSubscriptionError::Timeout {
+                    context: timeout_context.clone(),
+                };
+                let _ = pending.completion.send(Err(error));
+                finish_stream_terminal(
+                    timeout_assignments,
+                    timeout_connection,
+                    pending.stream_keys,
+                    pending.unconfirmed_reservation_token,
+                    timeout_events,
+                    timeout_context,
+                    StreamSubscriptionOutcome::TimedOut,
+                    terminal_claimed,
+                )
+                .await;
+            }
+        });
+
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => {
+                lifecycle.emit_terminal(
+                    &self.stream_subscription_events,
+                    context.clone(),
+                    StreamSubscriptionOutcome::ProtocolError,
+                );
+                Err(StreamSubscriptionError::ResponseChannelClosed { context })
+            }
+        }
+    }
+
     /// Unsubscribes from specified WebSocket streams.
     ///
     /// # Arguments
@@ -2675,6 +3486,8 @@ impl WebsocketStreams {
                     continue;
                 }
 
+                conn_state.confirmed_stream_keys.remove(&key);
+                conn_state.unconfirmed_stream_reservations.remove(&key);
                 let was_connected = conn_state.ws_write_tx.is_some()
                     && !conn_state.reconnection_pending
                     && !conn_state.close_initiated;
@@ -2781,6 +3594,20 @@ impl WebsocketStreams {
     /// - Validates and appends the time unit parameter if provided and valid
     /// - Handles URL parameter separator based on existing query parameters
     fn prepare_url(&self, streams: &[String], url_path: Option<&str>) -> String {
+        if url_path == Some("private") {
+            // Binance documents JSON SUBSCRIBE on the dedicated private route,
+            // but does not specify the extended listenKey+events JSON item
+            // shape. Connect to the query-free ws endpoint and keep using the
+            // generated SDK's established single-listen-key parameter. The
+            // official Java and Go connectors use the query-free /private/stream
+            // root for this JSON control path. Never place the private parameter
+            // into a URL.
+            return format!(
+                "{}/private/stream",
+                self.configuration.ws_url.as_deref().unwrap_or("")
+            );
+        }
+
         let mut url = format!(
             "{}/stream?streams={}",
             match url_path {
@@ -2861,11 +3688,22 @@ impl WebsocketStreams {
             };
 
             if need_new {
+                let previous_connection = conn_opt.clone();
                 match self.common.get_connection(true, url_path).await {
                     Ok(new_conn) => {
                         let mut map = self.connection_streams.lock().await;
-                        map.insert(key.clone(), new_conn.clone());
-                        conn_opt = Some(new_conn);
+                        let mapping_is_unchanged =
+                            match (map.get(&key), previous_connection.as_ref()) {
+                                (None, None) => true,
+                                (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+                                _ => false,
+                            };
+                        if mapping_is_unchanged {
+                            map.insert(key.clone(), new_conn.clone());
+                            conn_opt = Some(new_conn);
+                        } else {
+                            conn_opt = map.get(&key).cloned();
+                        }
                     }
                     Err(_) => {
                         warn!(
@@ -2976,12 +3814,105 @@ impl WebsocketHandler for WebsocketStreams {
     /// payload. The method uses a lock to safely access and clear the pending subscriptions
     /// from the connection state.
     async fn on_open(&self, _url: String, connection: Arc<WebsocketConnection>) {
-        let pending_subs: Vec<String> = {
+        let (path_scope, pending_subs, stale_pending, confirmed_streams) = {
             let mut conn_state = connection.state.lock().await;
-            take(&mut conn_state.pending_subscriptions)
+            let session_generation = conn_state
+                .writer_session_generation
+                .unwrap_or_else(|| connection.session_generation.load(Ordering::Acquire));
+            let stale_ids = conn_state
+                .pending_stream_subscriptions
+                .iter()
+                .filter_map(|(request_id, pending)| {
+                    (pending.context.session_generation != session_generation)
+                        .then_some(*request_id)
+                })
+                .collect::<Vec<_>>();
+            let stale_pending = stale_ids
                 .into_iter()
-                .collect()
+                .filter_map(|request_id| {
+                    conn_state.remove_pending_stream_subscription(request_id, true)
+                })
+                .collect::<Vec<_>>();
+            (
+                conn_state.url_path.clone(),
+                take(&mut conn_state.pending_subscriptions)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                stale_pending,
+                conn_state.confirmed_stream_keys.clone(),
+            )
         };
+
+        let stale_terminal_owners = stale_pending
+            .into_iter()
+            .map(|(pending, terminal_claimed)| {
+                let error = StreamSubscriptionError::SessionReplaced {
+                    context: pending.context.clone(),
+                };
+                let _ = pending.completion.send(Err(error));
+                spawn_stream_terminal_owner(
+                    Arc::clone(&self.connection_streams),
+                    connection.clone(),
+                    pending.stream_keys,
+                    pending.unconfirmed_reservation_token,
+                    self.stream_subscription_events.clone(),
+                    pending.context,
+                    StreamSubscriptionOutcome::SessionReplaced,
+                    terminal_claimed,
+                )
+            })
+            .collect::<Vec<_>>();
+        for terminal_owner in stale_terminal_owners {
+            if let Err(join_error) = terminal_owner.await {
+                error!(
+                    "Stale stream subscription terminal owner failed: {}",
+                    join_error
+                );
+            }
+        }
+
+        if path_scope.as_deref() == Some("private") {
+            let mut desired_subscriptions = {
+                let connection_streams = self.connection_streams.lock().await;
+                connection_streams
+                    .iter()
+                    .filter_map(|(key, assigned)| {
+                        if Arc::ptr_eq(assigned, &connection) && confirmed_streams.contains(key) {
+                            key.strip_prefix("private::")
+                                .map(std::string::ToString::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            desired_subscriptions.sort_unstable();
+            desired_subscriptions.dedup();
+
+            if !desired_subscriptions.is_empty() {
+                let request_id = self.next_stream_request_id();
+                if let Err(error) = self
+                    .send_subscription_payload_confirmed(
+                        &connection,
+                        &desired_subscriptions,
+                        request_id,
+                        STREAM_SUBSCRIPTION_ACK_TIMEOUT,
+                        None,
+                        Arc::new(StreamSubscriptionLifecycle::new()),
+                    )
+                    .await
+                {
+                    warn!(
+                        "Private stream resubscription failed on connection {} generation {} with request id {}: {}",
+                        connection.id,
+                        connection.session_generation.load(Ordering::Acquire),
+                        request_id,
+                        error
+                    );
+                }
+            }
+            return;
+        }
 
         if !pending_subs.is_empty() {
             info!("Processing queued subscriptions for connection");
@@ -3035,6 +3966,117 @@ impl WebsocketHandler for WebsocketStreams {
         for callback in callbacks {
             callback(&payload);
         }
+    }
+
+    async fn on_message_with_session(
+        &self,
+        data: String,
+        connection: Arc<WebsocketConnection>,
+        session_generation: u64,
+    ) {
+        let parsed: Option<Value> = serde_json::from_str(&data).ok();
+        let request_id = parsed
+            .as_ref()
+            .and_then(|message| message.get("id"))
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok());
+
+        if let (Some(message), Some(request_id)) = (parsed.as_ref(), request_id) {
+            let is_ack = message.as_object().is_some_and(|object| {
+                object.len() == 2
+                    && object.contains_key("id")
+                    && object.get("result").is_some_and(Value::is_null)
+            });
+            let reject_code = message.as_object().and_then(|object| {
+                let has_exact_keys = (object.len() == 2 || object.len() == 3)
+                    && object.contains_key("id")
+                    && object.contains_key("code")
+                    && object
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "id" | "code" | "msg"))
+                    && object.get("msg").is_none_or(Value::is_string);
+                has_exact_keys
+                    .then(|| object.get("code").and_then(Value::as_i64))
+                    .flatten()
+            });
+            let correlated = {
+                let mut state = connection.state.lock().await;
+                if let Some(pending) = state.pending_stream_subscriptions.get(&request_id) {
+                    if pending.context.session_generation != session_generation
+                        || state.writer_session_generation != Some(session_generation)
+                    {
+                        None
+                    } else {
+                        let receiver_closed = pending.completion.is_closed();
+                        let release_unconfirmed = pending.unconfirmed_reservation_token.is_some()
+                            && (receiver_closed || !is_ack);
+                        let (result, mut outcome) = if let Some(code) = reject_code {
+                            (
+                                Err(StreamSubscriptionError::Rejected {
+                                    context: pending.context.clone(),
+                                    code,
+                                }),
+                                StreamSubscriptionOutcome::Rejected { code },
+                            )
+                        } else if is_ack {
+                            (
+                                Ok(StreamSubscriptionAck {
+                                    context: pending.context.clone(),
+                                }),
+                                StreamSubscriptionOutcome::Acknowledged,
+                            )
+                        } else {
+                            (
+                                Err(StreamSubscriptionError::Protocol {
+                                    context: pending.context.clone(),
+                                }),
+                                StreamSubscriptionOutcome::ProtocolError,
+                            )
+                        };
+                        if receiver_closed && !pending.was_confirmed {
+                            outcome = StreamSubscriptionOutcome::Cancelled;
+                        }
+                        let emit_event = !is_ack || pending.was_confirmed || receiver_closed;
+                        state
+                            .remove_pending_stream_subscription(request_id, emit_event)
+                            .map(|(pending, terminal_claimed)| {
+                                (
+                                    pending,
+                                    result,
+                                    outcome,
+                                    terminal_claimed,
+                                    release_unconfirmed,
+                                )
+                            })
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some((pending, result, outcome, terminal_claimed, release_unconfirmed)) =
+                correlated
+            {
+                let event_context = pending.context.clone();
+                let _ = pending.completion.send(result);
+                finish_stream_terminal(
+                    Arc::clone(&self.connection_streams),
+                    connection,
+                    pending.stream_keys,
+                    release_unconfirmed
+                        .then_some(pending.unconfirmed_reservation_token)
+                        .flatten(),
+                    self.stream_subscription_events.clone(),
+                    event_context,
+                    outcome,
+                    terminal_claimed,
+                )
+                .await;
+                return;
+            }
+        }
+
+        self.on_message(data, connection).await;
     }
 
     /// Retrieves the reconnection URL for a specific WebSocket connection by identifying all streams associated with that connection.
@@ -3306,23 +4348,75 @@ where
     })
 }
 
+/// Creates a stream handler only after an exact numeric JSON SUBSCRIBE request
+/// has been acknowledged for the physical connection session that sent it.
+///
+/// # Errors
+///
+/// Returns a redacted [`StreamSubscriptionError`] if the stream base is not a
+/// connected stream transport or the exact request is not acknowledged.
+pub async fn create_stream_handler_confirmed<T>(
+    websocket_base: WebsocketBase,
+    stream_or_id: String,
+    request_id: u32,
+    ack_timeout: Duration,
+    url_path: Option<String>,
+) -> Result<(Arc<WebsocketStream<T>>, StreamSubscriptionAck), StreamSubscriptionError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    let ack = match &websocket_base {
+        WebsocketBase::WebsocketStreams(ws_streams) => {
+            ws_streams
+                .clone()
+                .subscribe_one_confirmed(
+                    stream_or_id.clone(),
+                    request_id,
+                    ack_timeout,
+                    url_path.as_deref(),
+                )
+                .await?
+        }
+        WebsocketBase::WebsocketApi(_) => {
+            return Err(StreamSubscriptionError::NoConnection { request_id });
+        }
+    };
+
+    Ok((
+        Arc::new(WebsocketStream {
+            websocket_base,
+            stream_or_id,
+            url_path,
+            id: Some(StreamId::Number(request_id)),
+            callback: Mutex::new(None),
+            _phantom: PhantomData,
+        }),
+        ack,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::TOKIO_SHARED_RT;
     use crate::common::utils::{SignatureGenerator, build_user_agent};
     use crate::common::websocket::{
         MAX_CONN_DURATION, PendingRequest, ReconnectEntry, RenewalEntry,
-        SendWebsocketMessageResult, WebsocketApi, WebsocketBase, WebsocketCommon,
+        SendWebsocketMessageResult, Subscription, WebsocketApi, WebsocketBase, WebsocketCommon,
         WebsocketConnection, WebsocketEvent, WebsocketEventEmitter, WebsocketHandler,
         WebsocketMessageSendOptions, WebsocketMode, WebsocketSessionLogonReq, WebsocketStream,
         WebsocketStreams, create_stream_handler, redacted_websocket_url,
     };
     use crate::config::{
         ConfigurationWebsocketApi, ConfigurationWebsocketStreams, PrivateKey, RawFrameKind,
-        RawFrameObserver, WebsocketLifecycleEvent,
+        RawFrameObserver, StreamSubscriptionObserver, WebsocketLifecycleEvent,
     };
-    use crate::errors::{WebsocketConnectionFailureReason, WebsocketError};
-    use crate::models::{StreamId, TimeUnit};
+    use crate::errors::{
+        StreamSubscriptionError, WebsocketConnectionFailureReason, WebsocketError,
+    };
+    use crate::models::{
+        StreamId, StreamSubscriptionEvent, StreamSubscriptionOutcome, StreamSubscriptionScope,
+        TimeUnit,
+    };
     use async_trait::async_trait;
     use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
     use futures::{SinkExt, StreamExt};
@@ -3541,6 +4635,57 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_scope_is_redacted_at_raw_and_lifecycle_observer_boundaries() {
+        TOKIO_SHARED_RT.block_on(async {
+            const SECRET_PATH: &str = "listen-key-in-arbitrary-path";
+            let raw_observed = Arc::new(StdMutex::new(Vec::new()));
+            let lifecycle_observed = Arc::new(StdMutex::new(Vec::new()));
+            let observer = {
+                let raw_observed = Arc::clone(&raw_observed);
+                let lifecycle_observed = Arc::clone(&lifecycle_observed);
+                RawFrameObserver::new_context(move |context| {
+                    raw_observed.lock().unwrap().push((
+                        context.path_scope.map(str::to_string),
+                        format!("{context:?}"),
+                    ));
+                })
+                .with_lifecycle(move |context| {
+                    lifecycle_observed.lock().unwrap().push((
+                        context.path_scope.map(str::to_string),
+                        format!("{context:?}"),
+                    ));
+                })
+            };
+            let connection = WebsocketConnection::new("redacted-scope-slot");
+            let common = WebsocketCommon::new_with_raw_frame_observer(
+                vec![Arc::clone(&connection)],
+                WebsocketMode::Single,
+                0,
+                None,
+                None,
+                Some(observer),
+            );
+
+            common
+                .on_text_frame("{}".to_string(), connection, 9, Some(SECRET_PATH))
+                .await;
+            common.observe_lifecycle(
+                "redacted-scope-slot",
+                9,
+                Some(SECRET_PATH),
+                WebsocketLifecycleEvent::Open,
+            );
+
+            let raw_observed = raw_observed.lock().unwrap();
+            assert_eq!(raw_observed[0].0.as_deref(), Some("other"));
+            assert!(!raw_observed[0].1.contains(SECRET_PATH));
+            let lifecycle_observed = lifecycle_observed.lock().unwrap();
+            assert_eq!(lifecycle_observed[0].0.as_deref(), Some("other"));
+            assert!(!lifecycle_observed[0].1.contains(SECRET_PATH));
+        });
+    }
+
+    #[test]
     fn lifecycle_context_distinguishes_overlapping_physical_sessions() {
         TOKIO_SHARED_RT.block_on(async {
             let observed = Arc::new(StdMutex::new(Vec::new()));
@@ -3674,6 +4819,7 @@ mod tests {
                 reconnect_delay: 500,
                 time_unit: None,
                 raw_frame_observer: Some(observer),
+                stream_subscription_observer: None,
                 agent: None,
                 user_agent: build_user_agent("raw-reader-test"),
             };
@@ -3752,6 +4898,7 @@ mod tests {
                 reconnect_delay: 5_000,
                 time_unit: None,
                 raw_frame_observer: Some(observer),
+                stream_subscription_observer: None,
                 agent: None,
                 user_agent: build_user_agent("scoped-observer-test"),
             };
@@ -3902,6 +5049,7 @@ mod tests {
             reconnect_delay: 500,
             time_unit: None,
             raw_frame_observer: None,
+            stream_subscription_observer: None,
             agent: None,
             user_agent: build_user_agent("product"),
         };
@@ -8004,6 +9152,7 @@ mod tests {
                         reconnect_delay: 500,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8033,6 +9182,7 @@ mod tests {
                         reconnect_delay: 500,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8061,6 +9211,7 @@ mod tests {
                         reconnect_delay: 500,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8113,6 +9264,7 @@ mod tests {
                             reconnect_delay: 500,
                             time_unit: None,
                             raw_frame_observer: None,
+                            stream_subscription_observer: None,
                             agent: None,
                             user_agent: build_user_agent("product"),
                         };
@@ -8148,6 +9300,7 @@ mod tests {
                         reconnect_delay: 500,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8185,6 +9338,7 @@ mod tests {
                         reconnect_delay: 500,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8806,6 +9960,20 @@ mod tests {
             use super::*;
 
             #[test]
+            fn private_json_control_url_never_contains_listen_key() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let ws =
+                        create_websocket_streams(Some("wss://fstream.binance.com"), None, None);
+                    let listen_key = "private-listen-key-must-not-leak".to_string();
+                    let url = ws.prepare_url(&[listen_key.clone()], Some("private"));
+                    assert_eq!(url, "wss://fstream.binance.com/private/stream");
+                    assert!(!url.contains(&listen_key));
+                    assert!(!url.contains("streams="));
+                    assert!(!url.contains("listenKey="));
+                });
+            }
+
+            #[test]
             fn without_time_unit_returns_base_url() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conns = vec![
@@ -8818,6 +9986,7 @@ mod tests {
                         reconnect_delay: 100,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8837,6 +10006,7 @@ mod tests {
                         reconnect_delay: 100,
                         time_unit: Some(TimeUnit::Millisecond),
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8856,6 +10026,7 @@ mod tests {
                         reconnect_delay: 100,
                         time_unit: Some(TimeUnit::Microsecond),
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8878,6 +10049,7 @@ mod tests {
                         reconnect_delay: 100,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8897,6 +10069,7 @@ mod tests {
                         reconnect_delay: 100,
                         time_unit: Some(TimeUnit::Millisecond),
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -8919,6 +10092,7 @@ mod tests {
                         reconnect_delay: 100,
                         time_unit: None,
                         raw_frame_observer: None,
+                        stream_subscription_observer: None,
                         agent: None,
                         user_agent: build_user_agent("product"),
                     };
@@ -9349,6 +10523,1467 @@ mod tests {
                     } else {
                         panic!("Expected Message::Text for msg2");
                     }
+                });
+            }
+        }
+
+        mod confirmed_subscription {
+            use super::*;
+
+            const LISTEN_KEY: &str = "listen-key-that-must-stay-private";
+
+            async fn setup_private_connection(
+                generation: u64,
+            ) -> (
+                Arc<WebsocketStreams>,
+                Arc<WebsocketConnection>,
+                tokio::sync::mpsc::UnboundedReceiver<Message>,
+            ) {
+                setup_private_connection_with_observers(generation, None, None).await
+            }
+
+            async fn setup_private_connection_with_observers(
+                generation: u64,
+                raw_frame_observer: Option<RawFrameObserver>,
+                stream_subscription_observer: Option<StreamSubscriptionObserver>,
+            ) -> (
+                Arc<WebsocketStreams>,
+                Arc<WebsocketConnection>,
+                tokio::sync::mpsc::UnboundedReceiver<Message>,
+            ) {
+                let config = ConfigurationWebsocketStreams {
+                    ws_url: Some("wss://fstream.binance.com".to_string()),
+                    mode: WebsocketMode::Single,
+                    reconnect_delay: 500,
+                    time_unit: None,
+                    raw_frame_observer,
+                    stream_subscription_observer,
+                    agent: None,
+                    user_agent: build_user_agent("confirmed-private-test"),
+                };
+                let ws = WebsocketStreams::new(
+                    config,
+                    vec![WebsocketConnection::new("private-c1")],
+                    vec![],
+                );
+                let connection = ws.common.connection_pool[0].clone();
+                let (writer, receiver) = unbounded_channel();
+                connection
+                    .session_generation
+                    .store(generation, Ordering::Release);
+                {
+                    let mut state = connection.state.lock().await;
+                    state.url_path = Some("private".to_string());
+                    state.ws_write_tx = Some(writer);
+                    state.writer_session_generation = Some(generation);
+                    state.reconnection_pending = false;
+                    state.close_initiated = false;
+                }
+                (ws, connection, receiver)
+            }
+
+            fn observe_subscription_events(
+                ws: &WebsocketStreams,
+            ) -> (
+                Subscription,
+                tokio::sync::mpsc::UnboundedReceiver<StreamSubscriptionEvent>,
+            ) {
+                let (sender, receiver) = unbounded_channel();
+                let subscription = ws.subscribe_on_stream_subscription_events(move |event| {
+                    let _ = sender.send(event);
+                });
+                (subscription, receiver)
+            }
+
+            async fn next_text(
+                receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
+            ) -> Value {
+                let message = timeout(Duration::from_millis(200), receiver.recv())
+                    .await
+                    .expect("timed out waiting for subscription payload")
+                    .expect("writer channel closed");
+                let Message::Text(text) = message else {
+                    panic!("expected text payload, got {message:?}");
+                };
+                serde_json::from_str(&text).expect("valid JSON subscription payload")
+            }
+
+            async fn next_event(
+                receiver: &mut tokio::sync::mpsc::UnboundedReceiver<StreamSubscriptionEvent>,
+            ) -> StreamSubscriptionEvent {
+                timeout(Duration::from_millis(200), receiver.recv())
+                    .await
+                    .expect("timed out waiting for subscription event")
+                    .expect("subscription event channel closed")
+            }
+
+            #[test]
+            fn configuration_builder_accepts_synchronous_subscription_observer() {
+                let observer = StreamSubscriptionObserver::new(|_| {});
+                let configuration = ConfigurationWebsocketStreams::builder()
+                    .stream_subscription_observer(observer)
+                    .build()
+                    .unwrap();
+                assert!(configuration.stream_subscription_observer.is_some());
+            }
+
+            #[test]
+            fn synchronous_observer_precedes_writer_and_raw_ack() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let sequence = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let observed_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let dispatch_barrier = Arc::new(std::sync::Barrier::new(2));
+                    let (dispatch_entered_tx, dispatch_entered_rx) = std::sync::mpsc::channel();
+
+                    let stream_observer = {
+                        let sequence = sequence.clone();
+                        let observed_events = observed_events.clone();
+                        let dispatch_barrier = dispatch_barrier.clone();
+                        StreamSubscriptionObserver::new(move |event| {
+                            observed_events.lock().unwrap().push(event.clone());
+                            match event.outcome {
+                                StreamSubscriptionOutcome::Dispatched => {
+                                    sequence.lock().unwrap().push("dispatched");
+                                    let _ = dispatch_entered_tx.send(());
+                                    dispatch_barrier.wait();
+                                }
+                                StreamSubscriptionOutcome::Acknowledged => {
+                                    sequence.lock().unwrap().push("acknowledged");
+                                }
+                                _ => sequence.lock().unwrap().push("other"),
+                            }
+                        })
+                    };
+                    let raw_observer = {
+                        let sequence = sequence.clone();
+                        RawFrameObserver::new_context(move |context| {
+                            assert_eq!(context.path_scope, Some("private"));
+                            sequence.lock().unwrap().push("raw");
+                        })
+                    };
+                    let (ws, connection, mut writes) = setup_private_connection_with_observers(
+                        14,
+                        Some(raw_observer),
+                        Some(stream_observer),
+                    )
+                    .await;
+                    let handler: Arc<dyn WebsocketHandler> = ws.clone();
+                    connection.set_handler(handler).await;
+
+                    let (result_tx, result_rx) = std::sync::mpsc::channel();
+                    let subscribe_thread = {
+                        let ws = ws.clone();
+                        std::thread::spawn(move || {
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap();
+                            let result = runtime.block_on(ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                141,
+                                Duration::from_millis(500),
+                                Some("private"),
+                            ));
+                            let _ = result_tx.send(result);
+                        })
+                    };
+
+                    dispatch_entered_rx
+                        .recv_timeout(Duration::from_millis(200))
+                        .expect("synchronous observer did not enter Dispatched");
+                    assert!(
+                        writes.try_recv().is_err(),
+                        "writer observed payload before synchronous Dispatched returned"
+                    );
+                    dispatch_barrier.wait();
+
+                    let payload = next_text(&mut writes).await;
+                    assert_eq!(payload["id"].as_u64(), Some(141));
+                    ws.common
+                        .on_text_frame(
+                            json!({"result": null, "id": 141}).to_string(),
+                            connection.clone(),
+                            14,
+                            Some("private"),
+                        )
+                        .await;
+                    let ack = result_rx
+                        .recv_timeout(Duration::from_millis(500))
+                        .expect("confirmed subscriber did not finish")
+                        .unwrap();
+                    subscribe_thread.join().unwrap();
+
+                    assert_eq!(ack.context.path_scope, StreamSubscriptionScope::Private);
+                    assert_eq!(
+                        *sequence.lock().unwrap(),
+                        vec!["dispatched", "raw", "acknowledged"]
+                    );
+                    let events = observed_events.lock().unwrap();
+                    assert_eq!(events.len(), 2);
+                    assert!(events.iter().all(|event| {
+                        event.context.path_scope == StreamSubscriptionScope::Private
+                    }));
+                    assert!(!format!("{events:?}").contains(LISTEN_KEY));
+                });
+            }
+
+            #[test]
+            fn synchronous_observer_panic_is_contained() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let observer = StreamSubscriptionObserver::new(|_| {
+                        panic!("observer failure must stay contained");
+                    });
+                    let (ws, connection, mut writes) =
+                        setup_private_connection_with_observers(15, None, Some(observer)).await;
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                151,
+                                Duration::from_millis(100),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let payload = next_text(&mut writes).await;
+                    assert_eq!(payload["id"].as_u64(), Some(151));
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 151}).to_string(),
+                        connection,
+                        15,
+                    )
+                    .await;
+                    let ack = subscribe.await.unwrap().unwrap();
+                    assert_eq!(ack.context.path_scope, StreamSubscriptionScope::Private);
+                });
+            }
+
+            #[test]
+            fn exact_unsigned_id_ack_is_bound_to_connection_and_generation() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(7).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let request_id = u32::MAX;
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                request_id,
+                                Duration::from_millis(100),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+
+                    let payload = next_text(&mut writes).await;
+                    assert_eq!(payload["method"], "SUBSCRIBE");
+                    assert_eq!(payload["id"].as_u64(), Some(u64::from(request_id)));
+                    assert_eq!(payload["params"], json!([LISTEN_KEY]));
+                    let dispatched = next_event(&mut events).await;
+                    assert_eq!(dispatched.outcome, StreamSubscriptionOutcome::Dispatched);
+                    assert_eq!(dispatched.context.request_id, request_id);
+                    assert_eq!(dispatched.context.session_generation, 7);
+
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": request_id}).to_string(),
+                        connection.clone(),
+                        7,
+                    )
+                    .await;
+
+                    let ack = subscribe.await.unwrap().unwrap();
+                    assert_eq!(ack.context.connection_id, connection.id);
+                    assert_eq!(ack.context.session_generation, 7);
+                    assert_eq!(ack.context.request_id, request_id);
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .confirmed_stream_keys
+                            .contains(&format!("private::{LISTEN_KEY}"))
+                    );
+                    let event = next_event(&mut events).await;
+                    assert_eq!(event.context, ack.context);
+                    assert_eq!(event.outcome, StreamSubscriptionOutcome::Acknowledged);
+                });
+            }
+
+            #[test]
+            fn correlated_reject_is_redacted_and_releases_unconfirmed_desired_state() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(3).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                17,
+                                Duration::from_millis(100),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    ws.on_message_with_session(
+                        json!({
+                            "code": 2,
+                            "msg": format!("invalid private value {LISTEN_KEY}"),
+                            "id": 17
+                        })
+                        .to_string(),
+                        connection.clone(),
+                        3,
+                    )
+                    .await;
+
+                    let error = subscribe.await.unwrap().unwrap_err();
+                    assert!(matches!(
+                        error,
+                        StreamSubscriptionError::Rejected { code: 2, .. }
+                    ));
+                    assert!(!format!("{error:?}").contains(LISTEN_KEY));
+                    assert!(!format!("{error}").contains(LISTEN_KEY));
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .confirmed_stream_keys
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Rejected { code: 2 }
+                    );
+                });
+            }
+
+            #[test]
+            fn callback_cannot_pin_a_rejected_unconfirmed_reservation() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(4).await;
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                18,
+                                Duration::from_millis(100),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    let key = format!("private::{LISTEN_KEY}");
+                    let callback: Arc<dyn Fn(&Value) + Send + Sync> = Arc::new(|_| {});
+                    connection
+                        .state
+                        .lock()
+                        .await
+                        .stream_callbacks
+                        .entry(key.clone())
+                        .or_default()
+                        .push(callback);
+
+                    ws.on_message_with_session(
+                        json!({"code": 2, "id": 18}).to_string(),
+                        connection.clone(),
+                        4,
+                    )
+                    .await;
+                    assert!(matches!(
+                        subscribe.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::Rejected { .. }
+                    ));
+                    assert!(!ws.connection_streams.lock().await.contains_key(&key));
+                    assert!(
+                        !connection
+                            .state
+                            .lock()
+                            .await
+                            .stream_callbacks
+                            .contains_key(&key)
+                    );
+                });
+            }
+
+            #[test]
+            fn delivered_reject_wins_over_waiter_cancellation_during_cleanup() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(4).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                19,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+
+                    let assignment_lock = ws.connection_streams.lock().await;
+                    let reject = {
+                        let ws = ws.clone();
+                        let connection = connection.clone();
+                        tokio::spawn(async move {
+                            ws.on_message_with_session(
+                                json!({"code": 2, "id": 19}).to_string(),
+                                connection,
+                                4,
+                            )
+                            .await;
+                        })
+                    };
+                    assert!(
+                        eventually_async(Duration::from_millis(200), || {
+                            let connection = connection.clone();
+                            async move {
+                                !connection
+                                    .state
+                                    .lock()
+                                    .await
+                                    .pending_stream_subscriptions
+                                    .contains_key(&19)
+                            }
+                        })
+                        .await
+                    );
+                    subscribe.abort();
+                    let _ = subscribe.await;
+                    drop(assignment_lock);
+                    reject.await.unwrap();
+
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Rejected { code: 2 }
+                    );
+                    assert!(
+                        timeout(Duration::from_millis(20), events.recv())
+                            .await
+                            .is_err()
+                    );
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                });
+            }
+
+            #[test]
+            fn matching_malformed_response_fails_closed() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(5).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                91,
+                                Duration::from_millis(100),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    ws.on_message_with_session(
+                        json!({"result": {"unexpected": true}, "id": 91}).to_string(),
+                        connection,
+                        5,
+                    )
+                    .await;
+                    assert!(matches!(
+                        subscribe.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::Protocol { .. }
+                    ));
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::ProtocolError
+                    );
+                });
+            }
+
+            #[test]
+            fn mixed_or_extra_control_response_fields_fail_closed() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let cases = [
+                        json!({"result": null, "code": 2, "id": 92}),
+                        json!({"result": null, "code": "bad", "id": 93}),
+                        json!({"result": null, "id": 94, "extra": true}),
+                    ];
+
+                    for response in cases {
+                        let request_id = response["id"]
+                            .as_u64()
+                            .and_then(|id| u32::try_from(id).ok())
+                            .unwrap();
+                        let (ws, connection, mut writes) = setup_private_connection(6).await;
+                        let subscribe = {
+                            let ws = ws.clone();
+                            tokio::spawn(async move {
+                                ws.subscribe_one_confirmed(
+                                    LISTEN_KEY.to_string(),
+                                    request_id,
+                                    Duration::from_millis(100),
+                                    Some("private"),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        ws.on_message_with_session(response.to_string(), connection, 6)
+                            .await;
+                        assert!(matches!(
+                            subscribe.await.unwrap().unwrap_err(),
+                            StreamSubscriptionError::Protocol { .. }
+                        ));
+                        assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    }
+                });
+            }
+
+            #[test]
+            fn concurrent_same_stream_has_one_dispatch_and_one_owner() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(8).await;
+                    let assignment_lock = ws.connection_streams.lock().await;
+                    let first = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                101,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let second = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                102,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    tokio::task::yield_now().await;
+                    drop(assignment_lock);
+
+                    let payload = next_text(&mut writes).await;
+                    let winner_id = payload["id"]
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .unwrap();
+                    assert!(winner_id == 101 || winner_id == 102);
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": winner_id}).to_string(),
+                        connection,
+                        8,
+                    )
+                    .await;
+
+                    let results = [first.await.unwrap(), second.await.unwrap()];
+                    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+                    assert_eq!(
+                        results
+                            .iter()
+                            .filter(|result| matches!(
+                                result,
+                                Err(StreamSubscriptionError::AlreadyDesired { .. })
+                            ))
+                            .count(),
+                        1
+                    );
+                    assert!(writes.try_recv().is_err());
+                    assert!(ws.is_subscribed(LISTEN_KEY).await);
+                });
+            }
+
+            #[test]
+            fn request_id_cannot_be_reused_within_one_physical_session() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(10).await;
+                    let first = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                121,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    ws.on_message_with_session(
+                        json!({"code": 2, "id": 121}).to_string(),
+                        connection.clone(),
+                        10,
+                    )
+                    .await;
+                    assert!(matches!(
+                        first.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::Rejected { .. }
+                    ));
+
+                    let retry = ws
+                        .clone()
+                        .subscribe_one_confirmed(
+                            LISTEN_KEY.to_string(),
+                            121,
+                            Duration::from_millis(200),
+                            Some("private"),
+                        )
+                        .await;
+                    assert!(matches!(
+                        retry,
+                        Err(StreamSubscriptionError::DuplicateRequestId { .. })
+                    ));
+                    assert!(writes.try_recv().is_err());
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+
+                    // A duplicate response from the first request has no new
+                    // pending request with the same wire identity to complete.
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 121}).to_string(),
+                        connection,
+                        10,
+                    )
+                    .await;
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                });
+            }
+
+            #[test]
+            fn old_generation_pending_id_cannot_be_overwritten_before_open_drain() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(1).await;
+                    let first = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                131,
+                                Duration::from_millis(500),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    connection.session_generation.store(2, Ordering::Release);
+                    connection.state.lock().await.writer_session_generation = Some(2);
+
+                    let second = ws
+                        .clone()
+                        .subscribe_one_confirmed(
+                            "another-private-key".to_string(),
+                            131,
+                            Duration::from_millis(100),
+                            Some("private"),
+                        )
+                        .await;
+                    assert!(matches!(
+                        second,
+                        Err(StreamSubscriptionError::DuplicateRequestId { .. })
+                    ));
+                    assert!(writes.try_recv().is_err());
+
+                    ws.on_open(
+                        "wss://fstream.binance.com/private/stream".to_string(),
+                        connection,
+                    )
+                    .await;
+                    assert!(matches!(
+                        first.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::SessionReplaced { .. }
+                    ));
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert!(!ws.is_subscribed("another-private-key").await);
+                });
+            }
+
+            #[test]
+            fn late_timeout_from_cancelled_attempt_cannot_remove_retry_owner() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(9).await;
+                    let key = format!("private::{LISTEN_KEY}");
+                    let first = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                111,
+                                Duration::from_millis(500),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    let first_token = connection
+                        .state
+                        .lock()
+                        .await
+                        .unconfirmed_stream_reservations[&key];
+                    first.abort();
+                    let _ = first.await;
+                    assert!(
+                        eventually_async(Duration::from_millis(200), || {
+                            let ws = ws.clone();
+                            async move { !ws.is_subscribed(LISTEN_KEY).await }
+                        })
+                        .await
+                    );
+
+                    let retry = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                112,
+                                Duration::from_millis(1_200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    let retry_token = connection
+                        .state
+                        .lock()
+                        .await
+                        .unconfirmed_stream_reservations[&key];
+                    assert_ne!(first_token, retry_token);
+
+                    sleep(Duration::from_millis(550)).await;
+                    assert!(ws.connection_streams.lock().await.contains_key(&key));
+                    assert_eq!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .unconfirmed_stream_reservations[&key],
+                        retry_token
+                    );
+
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 112}).to_string(),
+                        connection.clone(),
+                        9,
+                    )
+                    .await;
+                    retry.await.unwrap().unwrap();
+                    assert!(ws.is_subscribed(LISTEN_KEY).await);
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .confirmed_stream_keys
+                            .contains(&key)
+                    );
+                });
+            }
+
+            #[test]
+            fn string_id_does_not_correlate_and_numeric_request_times_out() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(11).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                23,
+                                Duration::from_millis(10),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": "23"}).to_string(),
+                        connection,
+                        11,
+                    )
+                    .await;
+                    assert!(matches!(
+                        subscribe.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::Timeout { .. }
+                    ));
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::TimedOut
+                    );
+                });
+            }
+
+            #[test]
+            fn reconnect_before_first_ack_does_not_resubscribe_unconfirmed_stream() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(1).await;
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                31,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    connection.session_generation.store(2, Ordering::Release);
+                    {
+                        let mut state = connection.state.lock().await;
+                        state.writer_session_generation = Some(2);
+                    }
+
+                    // A late response from the old reader cannot acknowledge a
+                    // request after the writer slot belongs to generation 2.
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 31}).to_string(),
+                        connection.clone(),
+                        1,
+                    )
+                    .await;
+                    ws.on_open(
+                        "wss://fstream.binance.com/private/stream".to_string(),
+                        connection.clone(),
+                    )
+                    .await;
+
+                    assert!(matches!(
+                        subscribe.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::SessionReplaced { .. }
+                    ));
+                    assert!(writes.try_recv().is_err());
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .confirmed_stream_keys
+                            .is_empty()
+                    );
+                });
+            }
+
+            #[test]
+            fn confirmed_private_stream_reconnects_without_secret_url_and_resubscribes() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(1).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let initial = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                41,
+                                Duration::from_millis(100),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    let initial_dispatched = next_event(&mut events).await;
+                    assert_eq!(
+                        initial_dispatched.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    assert_eq!(initial_dispatched.context.request_id, 41);
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 41}).to_string(),
+                        connection.clone(),
+                        1,
+                    )
+                    .await;
+                    initial.await.unwrap().unwrap();
+                    let initial_acknowledged = next_event(&mut events).await;
+                    assert_eq!(
+                        initial_acknowledged.outcome,
+                        StreamSubscriptionOutcome::Acknowledged
+                    );
+                    assert_eq!(initial_acknowledged.context, initial_dispatched.context);
+
+                    connection.session_generation.store(2, Ordering::Release);
+                    {
+                        let mut state = connection.state.lock().await;
+                        state.writer_session_generation = Some(2);
+                    }
+                    let reconnect_url = ws
+                        .get_reconnect_url("ignored".to_string(), connection.clone())
+                        .await;
+                    assert_eq!(reconnect_url, "wss://fstream.binance.com/private/stream");
+                    assert!(!reconnect_url.contains(LISTEN_KEY));
+                    assert!(!reconnect_url.contains("streams="));
+
+                    let reopened = {
+                        let ws = ws.clone();
+                        let connection = connection.clone();
+                        tokio::spawn(async move {
+                            ws.on_open(reconnect_url, connection).await;
+                        })
+                    };
+                    let payload = next_text(&mut writes).await;
+                    let request_id = payload["id"]
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .expect("reconnect id must be an unsigned u32");
+                    assert_eq!(payload["params"], json!([LISTEN_KEY]));
+                    let reconnect_dispatched = next_event(&mut events).await;
+                    assert_eq!(
+                        reconnect_dispatched.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    assert_eq!(reconnect_dispatched.context.request_id, request_id);
+                    assert_eq!(reconnect_dispatched.context.session_generation, 2);
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": request_id}).to_string(),
+                        connection.clone(),
+                        2,
+                    )
+                    .await;
+                    reopened.await.unwrap();
+                    let reconnect_acknowledged = next_event(&mut events).await;
+                    assert_eq!(
+                        reconnect_acknowledged.outcome,
+                        StreamSubscriptionOutcome::Acknowledged
+                    );
+                    assert_eq!(reconnect_acknowledged.context, reconnect_dispatched.context);
+                    assert!(ws.is_subscribed(LISTEN_KEY).await);
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .confirmed_stream_keys
+                            .contains(&format!("private::{LISTEN_KEY}"))
+                    );
+                });
+            }
+
+            #[test]
+            fn cancelled_initial_waiter_cannot_create_orphan_confirmed_subscription() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(1).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                47,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    subscribe.abort();
+                    let _ = subscribe.await;
+
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 47}).to_string(),
+                        connection.clone(),
+                        1,
+                    )
+                    .await;
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .confirmed_stream_keys
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Cancelled
+                    );
+
+                    connection.session_generation.store(2, Ordering::Release);
+                    {
+                        let mut state = connection.state.lock().await;
+                        state.writer_session_generation = Some(2);
+                    }
+                    ws.on_open(
+                        "wss://fstream.binance.com/private/stream".to_string(),
+                        connection,
+                    )
+                    .await;
+                    assert!(writes.try_recv().is_err());
+                    assert!(
+                        timeout(Duration::from_millis(20), events.recv())
+                            .await
+                            .is_err()
+                    );
+                });
+            }
+
+            #[test]
+            fn cancelled_attempt_emits_only_one_terminal_after_timeout() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(1).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                48,
+                                Duration::from_millis(20),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    subscribe.abort();
+                    let _ = subscribe.await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Cancelled
+                    );
+                    {
+                        let state = connection.state.lock().await;
+                        assert!(!state.pending_stream_subscriptions.contains_key(&48));
+                        assert_eq!(state.stream_request_id_generations.get(&48), Some(&1));
+                    }
+
+                    // The cancellation event is published only after the old
+                    // reservation is gone, so an event-driven retry can claim
+                    // the same private stream immediately.
+                    let retry = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                148,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let retry_payload = next_text(&mut writes).await;
+                    assert_eq!(retry_payload["id"].as_u64(), Some(148));
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    sleep(Duration::from_millis(40)).await;
+                    assert!(
+                        timeout(Duration::from_millis(20), events.recv())
+                            .await
+                            .is_err()
+                    );
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 148}).to_string(),
+                        connection,
+                        1,
+                    )
+                    .await;
+                    retry.await.unwrap().unwrap();
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Acknowledged
+                    );
+                });
+            }
+
+            #[test]
+            fn cancellation_after_ack_delivery_but_before_commit_releases_assignment() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(1).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                49,
+                                Duration::from_millis(200),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+
+                    // Hold the assignment lock so the waiter receives its ACK
+                    // but cannot commit ownership before it is cancelled.
+                    let assignment_lock = ws.connection_streams.lock().await;
+                    ws.on_message_with_session(
+                        json!({"result": null, "id": 49}).to_string(),
+                        connection.clone(),
+                        1,
+                    )
+                    .await;
+                    tokio::task::yield_now().await;
+                    subscribe.abort();
+                    let _ = subscribe.await;
+                    drop(assignment_lock);
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Cancelled
+                    );
+
+                    assert!(
+                        eventually_async(Duration::from_millis(200), || {
+                            let ws = ws.clone();
+                            async move { !ws.is_subscribed(LISTEN_KEY).await }
+                        })
+                        .await
+                    );
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .confirmed_stream_keys
+                            .is_empty()
+                    );
+
+                    connection.session_generation.store(2, Ordering::Release);
+                    {
+                        let mut state = connection.state.lock().await;
+                        state.writer_session_generation = Some(2);
+                    }
+                    ws.on_open(
+                        "wss://fstream.binance.com/private/stream".to_string(),
+                        connection,
+                    )
+                    .await;
+                    assert!(writes.try_recv().is_err());
+                    assert!(
+                        timeout(Duration::from_millis(20), events.recv())
+                            .await
+                            .is_err()
+                    );
+                });
+            }
+
+            #[test]
+            fn dispatch_failure_owner_survives_waiter_abort_and_cleans_before_terminal() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let dispatch_barrier = Arc::new(std::sync::Barrier::new(2));
+                    let (dispatch_entered_tx, dispatch_entered_rx) = std::sync::mpsc::channel();
+                    let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+                    let observer = {
+                        let outcomes = outcomes.clone();
+                        let dispatch_barrier = dispatch_barrier.clone();
+                        StreamSubscriptionObserver::new(move |event| {
+                            outcomes.lock().unwrap().push(event.outcome.clone());
+                            match event.outcome {
+                                StreamSubscriptionOutcome::Dispatched => {
+                                    let _ = dispatch_entered_tx.send(());
+                                    dispatch_barrier.wait();
+                                }
+                                StreamSubscriptionOutcome::DispatchFailed => {
+                                    let _ = terminal_tx.send(());
+                                }
+                                _ => {}
+                            }
+                        })
+                    };
+                    let (ws, connection, writes) =
+                        setup_private_connection_with_observers(1, None, Some(observer)).await;
+                    drop(writes);
+
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                50,
+                                Duration::from_secs(30),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    dispatch_entered_rx
+                        .recv_timeout(Duration::from_millis(200))
+                        .expect("synchronous Dispatched observer was not entered");
+
+                    // The terminal owner must block here after atomically
+                    // removing pending state but before publishing the event.
+                    let assignment_lock = ws.connection_streams.lock().await;
+                    dispatch_barrier.wait();
+                    assert!(
+                        eventually_async(Duration::from_millis(200), || {
+                            let connection = connection.clone();
+                            async move {
+                                !connection
+                                    .state
+                                    .lock()
+                                    .await
+                                    .pending_stream_subscriptions
+                                    .contains_key(&50)
+                            }
+                        })
+                        .await
+                    );
+                    subscribe.abort();
+                    assert!(subscribe.await.unwrap_err().is_cancelled());
+                    assert!(matches!(
+                        terminal_rx.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    ));
+
+                    drop(assignment_lock);
+                    terminal_rx
+                        .recv_timeout(Duration::from_millis(200))
+                        .expect("detached terminal owner did not publish DispatchFailed");
+                    assert_eq!(
+                        *outcomes.lock().unwrap(),
+                        vec![
+                            StreamSubscriptionOutcome::Dispatched,
+                            StreamSubscriptionOutcome::DispatchFailed,
+                        ]
+                    );
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .unconfirmed_stream_reservations
+                            .is_empty()
+                    );
+                });
+            }
+
+            #[test]
+            fn arbitrary_internal_scope_is_collapsed_in_subscription_diagnostics() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, mut writes) = setup_private_connection(1).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    {
+                        let mut state = connection.state.lock().await;
+                        state.url_path = Some(LISTEN_KEY.to_string());
+                    }
+                    let subscribe = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                52,
+                                Duration::from_millis(100),
+                                Some(LISTEN_KEY),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    let dispatched = next_event(&mut events).await;
+                    assert_eq!(
+                        dispatched.context.path_scope,
+                        StreamSubscriptionScope::Other
+                    );
+                    assert!(!format!("{dispatched:?}").contains(LISTEN_KEY));
+
+                    ws.on_message_with_session(
+                        json!({"code": 2, "msg": LISTEN_KEY, "id": 52}).to_string(),
+                        connection,
+                        1,
+                    )
+                    .await;
+                    let error = subscribe.await.unwrap().unwrap_err();
+                    let StreamSubscriptionError::Rejected { context, code: 2 } = &error else {
+                        panic!("expected correlated rejection, got {error:?}");
+                    };
+                    assert_eq!(context.path_scope, StreamSubscriptionScope::Other);
+                    assert!(!format!("{error:?}").contains(LISTEN_KEY));
+                    assert!(!format!("{error}").contains(LISTEN_KEY));
+                    let rejected = next_event(&mut events).await;
+                    assert_eq!(rejected.context.path_scope, StreamSubscriptionScope::Other);
+                    assert!(!format!("{rejected:?}").contains(LISTEN_KEY));
+                });
+            }
+
+            #[test]
+            fn disconnected_observer_retry_cannot_dispatch_on_closing_session() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let (retry_tx, mut retry_rx) = unbounded_channel();
+                    let observer = {
+                        let outcomes = outcomes.clone();
+                        StreamSubscriptionObserver::new(move |event| {
+                            outcomes.lock().unwrap().push(event.outcome.clone());
+                            if event.outcome == StreamSubscriptionOutcome::Disconnected {
+                                let _ = retry_tx.send(());
+                            }
+                        })
+                    };
+                    let (ws, connection, mut writes) =
+                        setup_private_connection_with_observers(1, None, Some(observer)).await;
+                    let initial = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            ws.subscribe_one_confirmed(
+                                LISTEN_KEY.to_string(),
+                                61,
+                                Duration::from_secs(30),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+                    let initial_payload = next_text(&mut writes).await;
+                    assert_eq!(initial_payload["id"].as_u64(), Some(61));
+
+                    let retry = {
+                        let ws = ws.clone();
+                        tokio::spawn(async move {
+                            retry_rx
+                                .recv()
+                                .await
+                                .expect("Disconnected observer did not signal retry");
+                            ws.subscribe_one_confirmed(
+                                "replacement-private-stream".to_string(),
+                                62,
+                                Duration::from_millis(20),
+                                Some("private"),
+                            )
+                            .await
+                        })
+                    };
+
+                    ws.disconnect().await.unwrap();
+                    assert!(matches!(
+                        initial.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::Disconnected { .. }
+                    ));
+                    assert!(matches!(
+                        retry.await.unwrap().unwrap_err(),
+                        StreamSubscriptionError::NoConnection { request_id: 62 }
+                    ));
+                    assert_eq!(
+                        *outcomes.lock().unwrap(),
+                        vec![
+                            StreamSubscriptionOutcome::Dispatched,
+                            StreamSubscriptionOutcome::Disconnected,
+                        ]
+                    );
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .pending_stream_subscriptions
+                            .is_empty()
+                    );
+                    while let Ok(message) = writes.try_recv() {
+                        assert!(
+                            !matches!(message, Message::Text(_)),
+                            "retry dispatched a payload onto the closing session"
+                        );
+                    }
+                });
+            }
+
+            #[test]
+            fn disconnected_writer_fails_without_leaking_or_retaining_stream() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let (ws, connection, _writes) = setup_private_connection(1).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    {
+                        let mut state = connection.state.lock().await;
+                        state.ws_write_tx = None;
+                        state.writer_session_generation = None;
+                    }
+                    let error = ws
+                        .clone()
+                        .subscribe_one_confirmed(
+                            LISTEN_KEY.to_string(),
+                            51,
+                            Duration::from_millis(10),
+                            Some("private"),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(matches!(
+                        error,
+                        StreamSubscriptionError::NotConnected { .. }
+                    ));
+                    assert!(!format!("{error:?}").contains(LISTEN_KEY));
+                    assert!(!ws.is_subscribed(LISTEN_KEY).await);
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::DispatchFailed
+                    );
+                    assert!(
+                        connection
+                            .state
+                            .lock()
+                            .await
+                            .pending_stream_subscriptions
+                            .is_empty()
+                    );
                 });
             }
         }
