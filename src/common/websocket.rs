@@ -10,7 +10,7 @@ use std::{
     marker::PhantomData,
     mem::take,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -21,7 +21,7 @@ use tokio::{
     sync::{
         Mutex, Notify,
         mpsc::{Receiver, Sender, UnboundedSender, channel, unbounded_channel},
-        oneshot,
+        oneshot, watch,
     },
     task::JoinHandle,
     time::{sleep, timeout},
@@ -432,6 +432,17 @@ struct PendingStreamSubscription {
     completion: oneshot::Sender<Result<StreamSubscriptionAck, StreamSubscriptionError>>,
 }
 
+impl PendingStreamSubscription {
+    fn receiver_cancellation_wins(&self, receiver_closed: bool) -> bool {
+        #[cfg(feature = "derivatives_trading_usds_futures")]
+        let caller_managed = self.ownership == PendingStreamSubscriptionOwnership::CallerManaged;
+        #[cfg(not(feature = "derivatives_trading_usds_futures"))]
+        let caller_managed = false;
+
+        receiver_closed && (!self.was_confirmed || caller_managed)
+    }
+}
+
 #[cfg(feature = "derivatives_trading_usds_futures")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingStreamSubscriptionOwnership {
@@ -561,6 +572,9 @@ pub struct WebsocketCommon {
     agent: Option<AgentConnector>,
     user_agent: Option<String>,
     raw_frame_observer: Option<RawFrameObserver>,
+    terminal_shutdown: AtomicBool,
+    terminal_shutdown_tx: watch::Sender<bool>,
+    background_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl WebsocketCommon {
@@ -602,6 +616,7 @@ impl WebsocketCommon {
 
         let (reconnect_tx, reconnect_rx) = channel::<ReconnectEntry>(mode.pool_size());
         let (renewal_tx, renewal_rx) = channel::<RenewalEntry>(mode.pool_size());
+        let (terminal_shutdown_tx, _) = watch::channel(false);
 
         let common = Arc::new(Self {
             events: WebsocketEventEmitter::new(),
@@ -614,12 +629,144 @@ impl WebsocketCommon {
             agent,
             user_agent,
             raw_frame_observer,
+            terminal_shutdown: AtomicBool::new(false),
+            terminal_shutdown_tx,
+            background_tasks: StdMutex::new(Vec::new()),
         });
 
-        Self::spawn_reconnect_loop(Arc::clone(&common), reconnect_rx);
-        Self::spawn_renewal_loop(&Arc::clone(&common), renewal_rx);
+        let terminal_shutdown_rx = common.terminal_shutdown_tx.subscribe();
+        let reconnect_task = Self::spawn_reconnect_loop(
+            Arc::clone(&common),
+            reconnect_rx,
+            terminal_shutdown_rx.clone(),
+        );
+        let renewal_task = Self::spawn_renewal_loop(&common, renewal_rx, terminal_shutdown_rx);
+        common
+            .background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([reconnect_task, renewal_task]);
 
         common
+    }
+
+    fn register_background_task(&self, task: JoinHandle<()>) {
+        let mut tasks = self
+            .background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|existing| !existing.is_finished());
+        tasks.push(task);
+    }
+
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    fn begin_terminal_shutdown(&self) {
+        if !self.terminal_shutdown.swap(true, Ordering::AcqRel) {
+            self.terminal_shutdown_tx.send_replace(true);
+        }
+    }
+
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    async fn finish_terminal_shutdown(&self) {
+        self.begin_terminal_shutdown();
+
+        // Serialize with every physical initializer. Once this guard is
+        // observed after the terminal flag, no initializer can publish a new
+        // writer or actor behind the shutdown boundary.
+        for connection in &self.connection_pool {
+            let _init_guard = connection.init_lock.lock().await;
+            let writer = {
+                let mut state = connection.state.lock().await;
+                state.close_initiated = true;
+                state.reconnection_pending = false;
+                state.renewal_pending = false;
+                state.is_session_logged_on = false;
+                state.handler = None;
+                state.writer_session_generation = None;
+                state.ws_write_tx.take()
+            };
+            if let Some(writer) = writer {
+                let _ = writer.send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "".into(),
+                })));
+            }
+        }
+
+        let tasks = {
+            let mut tasks = self
+                .background_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            take(&mut *tasks)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registered_background_task_count(&self) -> usize {
+        self.background_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn installed_handler_count(&self) -> usize {
+        let mut count = 0;
+        for connection in &self.connection_pool {
+            if connection.state.lock().await.handler.is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn installed_writer_count(&self) -> usize {
+        let mut count = 0;
+        for connection in &self.connection_pool {
+            if connection.state.lock().await.ws_write_tx.is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pending_stream_subscription_count(&self) -> usize {
+        let mut count = 0;
+        for connection in &self.connection_pool {
+            count += connection
+                .state
+                .lock()
+                .await
+                .pending_stream_subscriptions
+                .len();
+        }
+        count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_shutdown_started(&self) -> bool {
+        self.terminal_shutdown.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn lock_first_connection_state(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, WebsocketConnectionState> {
+        self.connection_pool
+            .first()
+            .expect("test runtime must own one connection")
+            .state
+            .lock()
+            .await
     }
 
     /// Spawns an asynchronous loop to handle websocket reconnection attempts
@@ -639,9 +786,26 @@ impl WebsocketCommon {
     /// - Applies a configurable delay before attempting reconnection
     /// - Attempts to reinitialize the connection with the provided URL
     /// - Handles and logs any reconnection errors
-    fn spawn_reconnect_loop(common: Arc<Self>, mut reconnect_rx: Receiver<ReconnectEntry>) {
+    fn spawn_reconnect_loop(
+        common: Arc<Self>,
+        mut reconnect_rx: Receiver<ReconnectEntry>,
+        mut terminal_shutdown_rx: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
         spawn(async move {
-            while let Some(entry) = reconnect_rx.recv().await {
+            loop {
+                let entry = select! {
+                    biased;
+                    changed = terminal_shutdown_rx.changed() => {
+                        if changed.is_err() || *terminal_shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    entry = reconnect_rx.recv() => {
+                        let Some(entry) = entry else { break };
+                        entry
+                    }
+                };
                 info!("Scheduling reconnect for id {}", entry.connection_id);
 
                 if let Some(conn_arc) = common
@@ -668,7 +832,14 @@ impl WebsocketCommon {
                         },
                     );
                     if !entry.is_renewal {
-                        sleep(Duration::from_millis(common.reconnect_delay as u64)).await;
+                        select! {
+                            biased;
+                            _ = terminal_shutdown_rx.changed() => break,
+                            () = sleep(Duration::from_millis(common.reconnect_delay as u64)) => {}
+                        }
+                    }
+                    if common.terminal_shutdown.load(Ordering::Acquire) {
+                        break;
                     }
                     if conn_arc.session_generation.load(Ordering::Acquire)
                         != entry.session_generation
@@ -683,16 +854,18 @@ impl WebsocketCommon {
                         .get_reconnect_url(&entry.url, Arc::clone(&conn_arc))
                         .await;
                     let common_clone = Arc::clone(&common);
-                    if common_clone
-                        .init_connect(
+                    let reconnect_result = select! {
+                        biased;
+                        _ = terminal_shutdown_rx.changed() => break,
+                        result = common_clone.init_connect(
                             &reconnect_url,
                             entry.is_renewal,
                             Some(conn_arc.clone()),
                             Some(entry.session_generation),
                         )
-                        .await
-                        .is_err()
-                    {
+                        => result,
+                    };
+                    if reconnect_result.is_err() {
                         error!(
                             "Reconnect failed for {} → {}",
                             entry.connection_id,
@@ -700,12 +873,16 @@ impl WebsocketCommon {
                         );
                     }
 
-                    sleep(Duration::from_secs(1)).await;
+                    select! {
+                        biased;
+                        _ = terminal_shutdown_rx.changed() => break,
+                        () = sleep(Duration::from_secs(1)) => {}
+                    }
                 } else {
                     warn!("No connection {} found for reconnect", entry.connection_id);
                 }
             }
-        });
+        })
     }
 
     /// Spawns an asynchronous loop to manage connection renewals
@@ -721,7 +898,11 @@ impl WebsocketCommon {
     /// - Tracks connection expiration using a delay queue
     /// - Initiates reconnection process when a connection expires
     /// - Handles and logs any renewal failures
-    fn spawn_renewal_loop(common: &Arc<Self>, renewal_rx: Receiver<RenewalEntry>) {
+    fn spawn_renewal_loop(
+        common: &Arc<Self>,
+        renewal_rx: Receiver<RenewalEntry>,
+        mut terminal_shutdown_rx: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
         let common = Arc::clone(common);
         spawn(async move {
             let mut dq = DelayQueue::new();
@@ -729,6 +910,12 @@ impl WebsocketCommon {
 
             loop {
                 select! {
+                    biased;
+                    changed = terminal_shutdown_rx.changed() => {
+                        if changed.is_err() || *terminal_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
                     Some(entry) = renewal_rx.recv() => {
                         debug!("Scheduling renewal for {}", entry.connection_id);
                         dq.insert(entry, MAX_CONN_DURATION);
@@ -771,7 +958,7 @@ impl WebsocketCommon {
                     }
                 }
             }
-        });
+        })
     }
 
     /// Checks if a WebSocket connection is ready for use.
@@ -1318,8 +1505,14 @@ impl WebsocketCommon {
         connection: Option<Arc<WebsocketConnection>>,
         expected_session_generation: Option<u64>,
     ) -> Result<(), WebsocketError> {
+        if self.terminal_shutdown.load(Ordering::Acquire) {
+            return Err(WebsocketError::NotConnected);
+        }
         let conn = connection.unwrap_or(self.get_connection(true, None).await?);
         let _init_guard = conn.init_lock.lock().await;
+        if self.terminal_shutdown.load(Ordering::Acquire) {
+            return Err(WebsocketError::NotConnected);
+        }
         if expected_session_generation
             .is_some_and(|expected| conn.session_generation.load(Ordering::Acquire) != expected)
         {
@@ -1358,6 +1551,9 @@ impl WebsocketCommon {
             .inspect_err(|_| {
                 error!("Handshake failed {}", redacted_websocket_url(url));
             })?;
+        if self.terminal_shutdown.load(Ordering::Acquire) {
+            return Err(WebsocketError::NotConnected);
+        }
         let session_generation = conn
             .session_generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1412,7 +1608,7 @@ impl WebsocketCommon {
             let writer_url = url.to_string();
             let writer_path_scope = path_scope.clone();
 
-            spawn(async move {
+            let writer_task = spawn(async move {
                 let mut sink = write_half;
                 while let Some(msg) = rx.recv().await {
                     if let Err(e) = sink.send(msg).await {
@@ -1473,6 +1669,7 @@ impl WebsocketCommon {
                 }
                 debug!("Writer {} exit", wconn.id);
             });
+            self.register_background_task(writer_task);
         }
 
         {
@@ -1481,7 +1678,7 @@ impl WebsocketCommon {
             let read_url = url.to_string();
             let reader_path_scope = path_scope.clone();
 
-            spawn(async move {
+            let reader_task = spawn(async move {
                 let mut stream_end_reason = None;
                 while let Some(item) = read_half.next().await {
                     match item {
@@ -1750,6 +1947,7 @@ impl WebsocketCommon {
 
                 debug!("Reader actor for {} exiting", reader_conn.id);
             });
+            self.register_background_task(reader_task);
         }
 
         // Keep the per-slot init lock until generated on-open work has
@@ -3182,6 +3380,35 @@ impl WebsocketStreams {
         }
     }
 
+    /// Permanently retires this stream runtime and all of its background
+    /// transport ownership. Unlike [`Self::disconnect`], this operation is not
+    /// reversible: reconnect/renewal loops, I/O actors, writers, and installed
+    /// handlers are all terminated before it returns.
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    pub(crate) async fn terminal_shutdown(self: &Arc<Self>) -> Result<(), WebsocketError> {
+        let owner = Arc::clone(self);
+        match spawn(async move {
+            owner.common.begin_terminal_shutdown();
+            let graceful_result = owner.disconnect().await;
+            owner.common.finish_terminal_shutdown().await;
+            // Terminal shutdown force-retires every writer/actor after the
+            // graceful attempt. A close-handshake timeout is therefore a
+            // diagnostic, not failure to retire the exact client. The only
+            // error returned below is failure of this cleanup owner itself.
+            if graceful_result.is_err() {
+                debug!("Exact-scope graceful close failed; forced terminal cleanup completed");
+            }
+            Ok(())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_error) => Err(WebsocketError::ServerError(format!(
+                "stream terminal shutdown owner failed: {join_error}"
+            ))),
+        }
+    }
+
     /// Checks if the WebSocket connection is currently active.
     ///
     /// # Returns
@@ -4466,7 +4693,7 @@ impl WebsocketHandler for WebsocketStreams {
                                 StreamSubscriptionOutcome::ProtocolError,
                             )
                         };
-                        if receiver_closed && !pending.was_confirmed {
+                        if pending.receiver_cancellation_wins(receiver_closed) {
                             outcome = StreamSubscriptionOutcome::Cancelled;
                         }
                         let emit_event = !is_ack || pending.was_confirmed || receiver_closed;
@@ -4870,7 +5097,7 @@ mod tests {
     use tokio::sync::{
         Mutex,
         mpsc::{Receiver, unbounded_channel},
-        oneshot,
+        oneshot, watch,
     };
     use tokio::time::{Duration, advance, pause, resume, sleep, timeout};
     use tokio_tungstenite::{
@@ -7550,6 +7777,7 @@ mod tests {
                     };
                     let (reconnect_tx, mut reconnect_rx) = channel::<ReconnectEntry>(1);
                     let (renewal_tx, _renewal_rx) = channel::<RenewalEntry>(1);
+                    let (terminal_shutdown_tx, _terminal_shutdown_rx) = watch::channel(false);
                     let common = Arc::new(WebsocketCommon {
                         events: WebsocketEventEmitter::new(),
                         mode: WebsocketMode::Single,
@@ -7561,6 +7789,9 @@ mod tests {
                         agent: None,
                         user_agent: None,
                         raw_frame_observer: Some(observer),
+                        terminal_shutdown: AtomicBool::new(false),
+                        terminal_shutdown_tx,
+                        background_tasks: StdMutex::new(Vec::new()),
                     });
                     let url = format!("ws://{addr}");
                     let res = common
@@ -12487,6 +12718,116 @@ mod tests {
                     scope: RoutedStreamScope,
                 ) -> RoutedStreamTarget {
                     RoutedStreamTarget::new(connection.id.clone(), generation, scope)
+                }
+
+                async fn assert_cancelled_routed_response(
+                    response: Value,
+                    request_id: u32,
+                    response_queued_before_guard_cleanup: bool,
+                ) {
+                    let (ws, connection, mut writes) =
+                        setup_routed_connection(RoutedStreamScope::Public, 13).await;
+                    let (_subscription, mut events) = observe_subscription_events(&ws);
+                    let request = {
+                        let ws = ws.clone();
+                        let target = target(&connection, 13, RoutedStreamScope::Public);
+                        tokio::spawn(async move {
+                            ws.subscribe_routed_confirmed(
+                                target,
+                                vec!["btcusdt@depth".to_string()],
+                                request_id,
+                                Duration::from_millis(100),
+                            )
+                            .await
+                        })
+                    };
+                    let _ = next_text(&mut writes).await;
+                    assert_eq!(
+                        next_event(&mut events).await.outcome,
+                        StreamSubscriptionOutcome::Dispatched
+                    );
+
+                    if response_queued_before_guard_cleanup {
+                        // Queue the wire response on the state mutex first,
+                        // then drop the receiver while both terminal owners are
+                        // unable to clean the pending entry. Tokio's FIFO mutex
+                        // ordering makes the response path win deterministically.
+                        let state = connection.state.lock().await;
+                        let mut response_delivery = Box::pin(ws.on_message_with_session(
+                            response.to_string(),
+                            connection.clone(),
+                            13,
+                        ));
+                        assert!(futures::poll!(response_delivery.as_mut()).is_pending());
+                        request.abort();
+                        assert!(request.await.unwrap_err().is_cancelled());
+                        drop(state);
+                        response_delivery.await;
+                    } else {
+                        request.abort();
+                        assert!(request.await.unwrap_err().is_cancelled());
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Cancelled
+                        );
+                        ws.on_message_with_session(response.to_string(), connection.clone(), 13)
+                            .await;
+                    }
+
+                    if response_queued_before_guard_cleanup {
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Cancelled
+                        );
+                    }
+                    assert!(
+                        timeout(Duration::from_millis(20), events.recv())
+                            .await
+                            .is_err(),
+                        "cancelled routed control emitted more than one terminal outcome"
+                    );
+                    let state = connection.state.lock().await;
+                    assert!(!state.pending_stream_subscriptions.contains_key(&request_id));
+                    assert_eq!(
+                        state.stream_request_id_generations.get(&request_id),
+                        Some(&13)
+                    );
+                }
+
+                #[test]
+                fn dropped_receiver_beats_ack_when_wire_response_owns_state_first() {
+                    TOKIO_SHARED_RT.block_on(assert_cancelled_routed_response(
+                        json!({"result": null, "id": 130}),
+                        130,
+                        true,
+                    ));
+                }
+
+                #[test]
+                fn dropped_receiver_beats_reject_when_wire_response_owns_state_first() {
+                    TOKIO_SHARED_RT.block_on(assert_cancelled_routed_response(
+                        json!({"code": 2, "msg": "invalid request", "id": 131}),
+                        131,
+                        true,
+                    ));
+                }
+
+                #[test]
+                fn late_ack_is_ignored_after_cancellation_guard_cleanup() {
+                    TOKIO_SHARED_RT.block_on(assert_cancelled_routed_response(
+                        json!({"result": null, "id": 132}),
+                        132,
+                        false,
+                    ));
+                }
+
+                #[test]
+                fn late_reject_is_ignored_after_cancellation_guard_cleanup() {
+                    TOKIO_SHARED_RT.block_on(assert_cancelled_routed_response(
+                        json!({"code": 2, "msg": "invalid request", "id": 133}),
+                        133,
+                        false,
+                    ));
                 }
 
                 #[test]

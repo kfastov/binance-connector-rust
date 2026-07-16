@@ -97,9 +97,12 @@ impl WebsocketStreamsHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use futures::StreamExt;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{
         accept_hdr_async,
         tungstenite::handshake::server::{Request, Response},
@@ -260,11 +263,98 @@ mod tests {
         assert!(public.is_connected().await);
         assert!(market.is_connected().await);
 
+        let public_runtime = public.runtime_weak();
+        assert_eq!(public.installed_handler_count().await, 1);
+        assert_eq!(public.installed_writer_count().await, 1);
+        assert_eq!(public.pending_stream_subscription_count().await, 0);
+        assert!(public.registered_background_task_count() >= 4);
+
         public.disconnect().await.unwrap();
         assert!(!public.is_connected().await);
         assert!(market.is_connected().await);
+        assert_eq!(public.installed_handler_count().await, 0);
+        assert_eq!(public.installed_writer_count().await, 0);
+        assert_eq!(public.pending_stream_subscription_count().await, 0);
+        assert_eq!(public.registered_background_task_count(), 0);
+        drop(public);
+        assert!(public_runtime.upgrade().is_none());
 
         market.disconnect().await.unwrap();
         assert!(!market.is_connected().await);
+    }
+
+    #[tokio::test]
+    async fn failed_exact_scope_handshake_releases_observer_and_transport_graph() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let observer_owner = Arc::new(());
+        let observer_owner_weak = Arc::downgrade(&observer_owner);
+        let observer_capture = Arc::clone(&observer_owner);
+        let observer = RawFrameObserver::new_context(move |_| {
+            let _ = &observer_capture;
+        });
+        let configuration = ConfigurationWebsocketStreams::builder()
+            .ws_url(format!("ws://{address}"))
+            .raw_frame_observer(observer)
+            .build()
+            .unwrap();
+        let handle = WebsocketStreamsHandle::new(configuration);
+
+        assert!(
+            handle
+                .connect_scope(UsdMStreamConnectionScope::Public)
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+        drop(handle);
+        drop(observer_owner);
+        tokio::task::yield_now().await;
+        assert!(observer_owner_weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_exact_disconnect_cannot_cancel_terminal_cleanup_owner() {
+        let (handle, mut paths, mut opens) = scoped_test_handle(1).await;
+        let client = Arc::new(
+            handle
+                .connect_scope(UsdMStreamConnectionScope::Public)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(paths.recv().await.as_deref(), Some("/public/stream"));
+        assert!(opens.recv().await.is_some());
+
+        let runtime = client.runtime_weak();
+        let state_guard = client.lock_first_connection_state().await;
+        let disconnect = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.disconnect().await })
+        };
+        timeout(Duration::from_secs(1), async {
+            while !client.terminal_shutdown_started() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal cleanup owner did not start");
+
+        disconnect.abort();
+        assert!(disconnect.await.unwrap_err().is_cancelled());
+        drop(state_guard);
+        drop(client);
+
+        timeout(Duration::from_secs(1), async {
+            while runtime.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached terminal cleanup retained the SDK runtime graph");
     }
 }

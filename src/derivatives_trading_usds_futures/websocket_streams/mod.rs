@@ -129,7 +129,14 @@ impl WebsocketStreams {
         }
         let websocket_streams_base =
             WebsocketStreamsBase::new(config, vec![], vec![scope.as_path_scope().to_string()]);
-        websocket_streams_base.clone().connect(Vec::new()).await?;
+        if let Err(error) = websocket_streams_base.clone().connect(Vec::new()).await {
+            // `connect` installs the generated handler before the handshake.
+            // A failed handshake therefore needs the same terminal cleanup as
+            // an explicitly retired exact-scope client; otherwise the handler
+            // and transport workers retain the entire base graph.
+            let _ = websocket_streams_base.terminal_shutdown().await;
+            return Err(error.into());
+        }
 
         Ok(Self::from_base(websocket_streams_base, Some(scope)))
     }
@@ -322,10 +329,74 @@ impl WebsocketStreams {
     /// `websocket_streams.disconnect().await`?;
     ///
     pub async fn disconnect(&self) -> anyhow::Result<()> {
+        if self.connection_scope.is_some() {
+            // Exact-scope clients are independently owned transport domains
+            // with no public reconnect operation. Their existing disconnect
+            // contract is therefore terminal: delayed SDK renewal/reconnect
+            // work must not reopen a retired route.
+            self.websocket_streams_base
+                .terminal_shutdown()
+                .await
+                .map_err(anyhow::Error::msg)
+        } else {
+            self.websocket_streams_base
+                .disconnect()
+                .await
+                .map_err(anyhow::Error::msg)
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_weak(&self) -> std::sync::Weak<crate::common::websocket::WebsocketCommon> {
+        Arc::downgrade(&self.websocket_streams_base.common)
+    }
+
+    #[cfg(test)]
+    fn registered_background_task_count(&self) -> usize {
         self.websocket_streams_base
-            .disconnect()
+            .common
+            .registered_background_task_count()
+    }
+
+    #[cfg(test)]
+    async fn installed_handler_count(&self) -> usize {
+        self.websocket_streams_base
+            .common
+            .installed_handler_count()
             .await
-            .map_err(anyhow::Error::msg)
+    }
+
+    #[cfg(test)]
+    async fn installed_writer_count(&self) -> usize {
+        self.websocket_streams_base
+            .common
+            .installed_writer_count()
+            .await
+    }
+
+    #[cfg(test)]
+    async fn pending_stream_subscription_count(&self) -> usize {
+        self.websocket_streams_base
+            .common
+            .pending_stream_subscription_count()
+            .await
+    }
+
+    #[cfg(test)]
+    fn terminal_shutdown_started(&self) -> bool {
+        self.websocket_streams_base
+            .common
+            .terminal_shutdown_started()
+    }
+
+    #[cfg(test)]
+    async fn lock_first_connection_state(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, crate::common::websocket::WebsocketConnectionState> {
+        self.websocket_streams_base
+            .common
+            .lock_first_connection_state()
+            .await
     }
 
     /// Checks if the WebSocket connection is currently active.
