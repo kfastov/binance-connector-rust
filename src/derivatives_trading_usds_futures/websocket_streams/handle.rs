@@ -13,7 +13,7 @@
 
 use crate::{common::config::ConfigurationWebsocketStreams, models::WebsocketStreamsConnectConfig};
 
-use super::WebsocketStreams;
+use super::{UsdMStreamConnectionScope, WebsocketStreams};
 
 #[derive(Clone)]
 pub struct WebsocketStreamsHandle {
@@ -74,5 +74,197 @@ impl WebsocketStreamsHandle {
         cfg: WebsocketStreamsConnectConfig,
     ) -> anyhow::Result<WebsocketStreams> {
         WebsocketStreams::connect(self.configuration.clone(), cfg.streams, cfg.mode).await
+    }
+
+    /// Connects one independent USD-M client to exactly one generated route.
+    ///
+    /// The client owns one `Single` connection slot and starts with no URL
+    /// subscriptions. Public and market callers can then use confirmed routed
+    /// JSON controls; private callers can use the confirmed user-data flow.
+    /// Each call returns an independent client and can be closed with its
+    /// existing [`WebsocketStreams::disconnect`] method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`anyhow::Error`] if the exact scoped connection fails.
+    pub async fn connect_scope(
+        &self,
+        scope: UsdMStreamConnectionScope,
+    ) -> anyhow::Result<WebsocketStreams> {
+        WebsocketStreams::connect_scope(self.configuration.clone(), scope).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio_tungstenite::{
+        accept_hdr_async,
+        tungstenite::handshake::server::{Request, Response},
+    };
+
+    use crate::common::config::{
+        ConfigurationWebsocketStreams, RawFrameObserver, WebsocketLifecycleEvent,
+    };
+    use crate::models::RoutedStreamScope;
+
+    use super::*;
+
+    type OpenObservation = (String, u64, Option<String>);
+
+    async fn scoped_test_handle(
+        expected_connections: usize,
+    ) -> (
+        WebsocketStreamsHandle,
+        UnboundedReceiver<String>,
+        UnboundedReceiver<OpenObservation>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (path_sender, path_receiver) = unbounded_channel();
+        tokio::spawn(async move {
+            for _ in 0..expected_connections {
+                let (stream, _) = listener.accept().await.unwrap();
+                let sender = path_sender.clone();
+                let websocket =
+                    accept_hdr_async(stream, move |request: &Request, response: Response| {
+                        sender.send(request.uri().path().to_string()).unwrap();
+                        Ok(response)
+                    })
+                    .await
+                    .unwrap();
+                tokio::spawn(async move {
+                    let mut websocket = websocket;
+                    while websocket.next().await.is_some() {}
+                });
+            }
+        });
+
+        let (open_sender, open_receiver) = unbounded_channel();
+        let observer = RawFrameObserver::new_context(|_| {}).with_lifecycle(move |context| {
+            if context.event == WebsocketLifecycleEvent::Open {
+                open_sender
+                    .send((
+                        context.connection_id.to_string(),
+                        context.session_generation,
+                        context.path_scope.map(str::to_string),
+                    ))
+                    .unwrap();
+            }
+        });
+        let configuration = ConfigurationWebsocketStreams::builder()
+            .ws_url(format!("ws://{address}"))
+            .raw_frame_observer(observer)
+            .build()
+            .unwrap();
+        (
+            WebsocketStreamsHandle::new(configuration),
+            path_receiver,
+            open_receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn exact_scope_opens_one_route_and_exposes_matching_identity() {
+        let (handle, mut paths, mut opens) = scoped_test_handle(3).await;
+
+        let public = handle
+            .connect_scope(UsdMStreamConnectionScope::Public)
+            .await
+            .unwrap();
+        assert_eq!(paths.recv().await.as_deref(), Some("/public/stream"));
+        let public_identity = public.connection_identity().unwrap();
+        assert_eq!(
+            opens.recv().await.unwrap(),
+            (
+                public_identity.connection_id.clone(),
+                public_identity.session_generation,
+                Some("public".to_string())
+            )
+        );
+        assert_eq!(public_identity.scope, UsdMStreamConnectionScope::Public);
+        let public_target = public.routed_target().unwrap();
+        assert_eq!(public_target.connection_id, public_identity.connection_id);
+        assert_eq!(
+            public_target.session_generation,
+            public_identity.session_generation
+        );
+        assert_eq!(public_target.path_scope, RoutedStreamScope::Public);
+
+        let market = handle
+            .connect_scope(UsdMStreamConnectionScope::Market)
+            .await
+            .unwrap();
+        assert_eq!(paths.recv().await.as_deref(), Some("/market/stream"));
+        let market_identity = market.connection_identity().unwrap();
+        assert_eq!(
+            opens.recv().await.unwrap(),
+            (
+                market_identity.connection_id.clone(),
+                market_identity.session_generation,
+                Some("market".to_string())
+            )
+        );
+        assert_eq!(market_identity.scope, UsdMStreamConnectionScope::Market);
+        assert_eq!(
+            market.routed_target().unwrap().path_scope,
+            RoutedStreamScope::Market
+        );
+
+        let private = handle
+            .connect_scope(UsdMStreamConnectionScope::Private)
+            .await
+            .unwrap();
+        assert_eq!(paths.recv().await.as_deref(), Some("/private/stream"));
+        let private_identity = private.connection_identity().unwrap();
+        assert_eq!(private_identity.scope, UsdMStreamConnectionScope::Private);
+        assert_eq!(
+            opens.recv().await.unwrap(),
+            (
+                private_identity.connection_id,
+                private_identity.session_generation,
+                Some("private".to_string())
+            )
+        );
+        assert!(private.routed_target().is_none());
+        assert!(paths.try_recv().is_err());
+
+        public.disconnect().await.unwrap();
+        market.disconnect().await.unwrap();
+        private.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_scope_clients_are_independent_disconnect_domains() {
+        let (handle, mut paths, mut opens) = scoped_test_handle(2).await;
+        let public = handle
+            .connect_scope(UsdMStreamConnectionScope::Public)
+            .await
+            .unwrap();
+        let market = handle
+            .connect_scope(UsdMStreamConnectionScope::Market)
+            .await
+            .unwrap();
+        let mut opened = vec![paths.recv().await.unwrap(), paths.recv().await.unwrap()];
+        opened.sort_unstable();
+        assert_eq!(opened, vec!["/market/stream", "/public/stream"]);
+        assert_ne!(
+            public.connection_identity().unwrap().connection_id,
+            market.connection_identity().unwrap().connection_id
+        );
+        let first_open = opens.recv().await.unwrap();
+        let second_open = opens.recv().await.unwrap();
+        assert_ne!(first_open.0, second_open.0);
+        assert!(public.is_connected().await);
+        assert!(market.is_connected().await);
+
+        public.disconnect().await.unwrap();
+        assert!(!public.is_connected().await);
+        assert!(market.is_connected().await);
+
+        market.disconnect().await.unwrap();
+        assert!(!market.is_connected().await);
     }
 }

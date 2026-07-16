@@ -37,6 +37,8 @@ use tokio_tungstenite::{
 use tokio_util::time::DelayQueue;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "derivatives_trading_usds_futures")]
+use super::models::RoutedStreamTarget;
 use super::{
     config::{
         AgentConnector, ConfigurationWebsocketApi, ConfigurationWebsocketStreams, RawFrameContext,
@@ -421,11 +423,20 @@ pub struct PendingRequest {
 struct PendingStreamSubscription {
     token: u64,
     context: StreamSubscriptionContext,
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    ownership: PendingStreamSubscriptionOwnership,
     stream_keys: Vec<String>,
     was_confirmed: bool,
     unconfirmed_reservation_token: Option<u64>,
     lifecycle: Arc<StreamSubscriptionLifecycle>,
     completion: oneshot::Sender<Result<StreamSubscriptionAck, StreamSubscriptionError>>,
+}
+
+#[cfg(feature = "derivatives_trading_usds_futures")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingStreamSubscriptionOwnership {
+    SdkManaged,
+    CallerManaged,
 }
 
 #[derive(Clone)]
@@ -2704,6 +2715,167 @@ struct UnconfirmedAssignmentGuard {
     armed: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ConfirmedStreamControlMethod {
+    Subscribe,
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    Unsubscribe,
+}
+
+impl ConfirmedStreamControlMethod {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Subscribe => "SUBSCRIBE",
+            #[cfg(feature = "derivatives_trading_usds_futures")]
+            Self::Unsubscribe => "UNSUBSCRIBE",
+        }
+    }
+}
+
+enum ConfirmedStreamControlOwnership {
+    SdkManaged {
+        unconfirmed_reservation_token: Option<u64>,
+    },
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    CallerManaged { target: RoutedStreamTarget },
+}
+
+struct ConfirmedStreamControl<'a> {
+    method: ConfirmedStreamControlMethod,
+    params: &'a [String],
+    ownership: ConfirmedStreamControlOwnership,
+}
+
+impl ConfirmedStreamControl<'_> {
+    fn context(
+        &self,
+        connection: &WebsocketConnection,
+        state: &WebsocketConnectionState,
+        request_id: u32,
+    ) -> StreamSubscriptionContext {
+        match &self.ownership {
+            ConfirmedStreamControlOwnership::SdkManaged { .. } => {
+                let session_generation = state
+                    .writer_session_generation
+                    .unwrap_or_else(|| connection.session_generation.load(Ordering::Acquire));
+                StreamSubscriptionContext {
+                    connection_id: connection.id.clone(),
+                    session_generation,
+                    request_id,
+                    path_scope: stream_subscription_scope(state.url_path.as_deref()),
+                }
+            }
+            #[cfg(feature = "derivatives_trading_usds_futures")]
+            ConfirmedStreamControlOwnership::CallerManaged { target } => {
+                target.subscription_context(request_id)
+            }
+        }
+    }
+
+    fn exact_session_is_current(
+        &self,
+        connection: &WebsocketConnection,
+        state: &WebsocketConnectionState,
+    ) -> bool {
+        #[cfg(not(feature = "derivatives_trading_usds_futures"))]
+        let _ = (connection, state);
+        match &self.ownership {
+            ConfirmedStreamControlOwnership::SdkManaged { .. } => true,
+            #[cfg(feature = "derivatives_trading_usds_futures")]
+            ConfirmedStreamControlOwnership::CallerManaged { target } => {
+                let current_generation = connection.session_generation.load(Ordering::Acquire);
+                let writer_generation_mismatch = state
+                    .writer_session_generation
+                    .is_some_and(|generation| generation != target.session_generation);
+                current_generation == target.session_generation
+                    && !writer_generation_mismatch
+                    && state.url_path.as_deref() == Some(target.path_scope.as_path_scope())
+            }
+        }
+    }
+
+    fn emit_pre_dispatch_terminal(&self) -> bool {
+        match &self.ownership {
+            ConfirmedStreamControlOwnership::SdkManaged { .. } => false,
+            #[cfg(feature = "derivatives_trading_usds_futures")]
+            ConfirmedStreamControlOwnership::CallerManaged { .. } => true,
+        }
+    }
+
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    fn pending_ownership(&self) -> PendingStreamSubscriptionOwnership {
+        match &self.ownership {
+            ConfirmedStreamControlOwnership::SdkManaged { .. } => {
+                PendingStreamSubscriptionOwnership::SdkManaged
+            }
+            #[cfg(feature = "derivatives_trading_usds_futures")]
+            ConfirmedStreamControlOwnership::CallerManaged { .. } => {
+                PendingStreamSubscriptionOwnership::CallerManaged
+            }
+        }
+    }
+}
+
+/// Cancellation owner for routed control requests. Unlike
+/// [`UnconfirmedAssignmentGuard`], this guard has no desired-stream ownership
+/// to release: the application owns its desired set and must reissue it after a
+/// newer physical session opens.
+#[cfg(feature = "derivatives_trading_usds_futures")]
+struct RoutedStreamControlGuard {
+    connection: Arc<WebsocketConnection>,
+    request_id: u32,
+    lifecycle: Arc<StreamSubscriptionLifecycle>,
+    events: StreamSubscriptionEventEmitter,
+    armed: bool,
+}
+
+#[cfg(feature = "derivatives_trading_usds_futures")]
+impl RoutedStreamControlGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "derivatives_trading_usds_futures")]
+impl Drop for RoutedStreamControlGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let connection = Arc::clone(&self.connection);
+        let request_id = self.request_id;
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let events = self.events.clone();
+        runtime.spawn(async move {
+            let cancelled_context = {
+                let mut state = connection.state.lock().await;
+                let owns_pending = state
+                    .pending_stream_subscriptions
+                    .get(&request_id)
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.lifecycle, &lifecycle));
+                if owns_pending {
+                    let (pending, terminal_claimed) = state
+                        .remove_pending_stream_subscription(request_id, true)
+                        .expect("lifecycle-matched routed control must still be pending");
+                    terminal_claimed.then_some(pending.context)
+                } else {
+                    lifecycle.claim_cancelled_if_dispatched()
+                }
+            };
+            if let Some(context) = cancelled_context {
+                StreamSubscriptionLifecycle::emit_claimed(
+                    &events,
+                    context,
+                    StreamSubscriptionOutcome::Cancelled,
+                );
+            }
+        });
+    }
+}
+
 impl UnconfirmedAssignmentGuard {
     fn disarm(&mut self) {
         self.armed = false;
@@ -2822,6 +2994,17 @@ impl WebsocketStreams {
                 stream_subscription_observer,
             ),
             url_paths,
+        })
+    }
+
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    pub(crate) fn single_connection_identity(&self) -> Option<(String, u64)> {
+        let connection = self.common.connection_pool.first()?;
+        (self.common.connection_pool.len() == 1).then(|| {
+            (
+                connection.id.clone(),
+                connection.session_generation.load(Ordering::Acquire),
+            )
         })
     }
 
@@ -3199,6 +3382,139 @@ impl WebsocketStreams {
         Ok(ack)
     }
 
+    /// Sends a confirmed JSON `SUBSCRIBE` to one exact routed `/public` or
+    /// `/market` physical session.
+    ///
+    /// The caller owns the desired topic set, pacing, connection budget, and
+    /// reconnect replay. This method never adds topics to SDK stream ownership
+    /// and never resubscribes them automatically. Topics are treated as a set:
+    /// they are sorted lexicographically and duplicates are removed before the
+    /// payload is encoded.
+    ///
+    /// `request_id` is always encoded as the caller-supplied unsigned JSON
+    /// integer. The caller must allocate monotonically increasing identifiers;
+    /// the SDK does not replace it with a random or generated value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted [`StreamSubscriptionError`] when the target is stale,
+    /// the request is invalid, cannot be dispatched, is rejected, times out,
+    /// or loses its exact physical session before acknowledgement.
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    pub(crate) async fn subscribe_routed_confirmed(
+        &self,
+        target: RoutedStreamTarget,
+        topics: Vec<String>,
+        request_id: u32,
+        ack_timeout: Duration,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        self.routed_stream_control_confirmed(
+            target,
+            topics,
+            request_id,
+            ack_timeout,
+            ConfirmedStreamControlMethod::Subscribe,
+        )
+        .await
+    }
+
+    /// Sends a confirmed JSON `UNSUBSCRIBE` to one exact routed `/public` or
+    /// `/market` physical session.
+    ///
+    /// This is a wire-level control primitive only. It does not mutate SDK
+    /// stream ownership, so the caller remains the single owner of the desired
+    /// set across initial connect and reconnect.
+    ///
+    /// `request_id` is always encoded as the caller-supplied unsigned JSON
+    /// integer. The caller must allocate monotonically increasing identifiers.
+    /// Topics are sorted lexicographically and deduplicated before encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted [`StreamSubscriptionError`] under the same exact
+    /// session and terminal-outcome rules as
+    /// [`Self::subscribe_routed_confirmed`].
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    pub(crate) async fn unsubscribe_routed_confirmed(
+        &self,
+        target: RoutedStreamTarget,
+        topics: Vec<String>,
+        request_id: u32,
+        ack_timeout: Duration,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        self.routed_stream_control_confirmed(
+            target,
+            topics,
+            request_id,
+            ack_timeout,
+            ConfirmedStreamControlMethod::Unsubscribe,
+        )
+        .await
+    }
+
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    async fn routed_stream_control_confirmed(
+        &self,
+        target: RoutedStreamTarget,
+        mut topics: Vec<String>,
+        request_id: u32,
+        ack_timeout: Duration,
+        control: ConfirmedStreamControlMethod,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        let lifecycle = Arc::new(StreamSubscriptionLifecycle::new());
+        let context = target.subscription_context(request_id);
+        lifecycle.set_context(context.clone());
+
+        if topics.is_empty() || topics.iter().any(String::is_empty) {
+            lifecycle.emit_terminal(
+                &self.stream_subscription_events,
+                context.clone(),
+                StreamSubscriptionOutcome::ProtocolError,
+            );
+            return Err(StreamSubscriptionError::Protocol { context });
+        }
+        topics.sort_unstable();
+        topics.dedup();
+
+        let Some(connection) = self
+            .common
+            .connection_pool
+            .iter()
+            .find(|connection| connection.id == target.connection_id)
+            .cloned()
+        else {
+            lifecycle.emit_terminal(
+                &self.stream_subscription_events,
+                context.clone(),
+                StreamSubscriptionOutcome::SessionReplaced,
+            );
+            return Err(StreamSubscriptionError::SessionReplaced { context });
+        };
+
+        let mut cancellation_guard = RoutedStreamControlGuard {
+            connection: connection.clone(),
+            request_id,
+            lifecycle: lifecycle.clone(),
+            events: self.stream_subscription_events.clone(),
+            armed: true,
+        };
+        let result = self
+            .send_confirmed_stream_control(
+                &connection,
+                ConfirmedStreamControl {
+                    method: control,
+                    params: &topics,
+                    ownership: ConfirmedStreamControlOwnership::CallerManaged { target },
+                },
+                request_id,
+                ack_timeout,
+                lifecycle,
+            )
+            .await;
+        cancellation_guard.disarm();
+        result
+    }
+
     async fn reserve_one_stream_assignment(
         &self,
         key: &str,
@@ -3271,62 +3587,161 @@ impl WebsocketStreams {
         unconfirmed_reservation_token: Option<u64>,
         lifecycle: Arc<StreamSubscriptionLifecycle>,
     ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
-        let mut state = connection.state.lock().await;
-        let session_generation = state
-            .writer_session_generation
-            .unwrap_or_else(|| connection.session_generation.load(Ordering::Acquire));
-        let context = StreamSubscriptionContext {
-            connection_id: connection.id.clone(),
-            session_generation,
+        self.send_confirmed_stream_control(
+            connection,
+            ConfirmedStreamControl {
+                method: ConfirmedStreamControlMethod::Subscribe,
+                params: streams,
+                ownership: ConfirmedStreamControlOwnership::SdkManaged {
+                    unconfirmed_reservation_token,
+                },
+            },
             request_id,
-            path_scope: stream_subscription_scope(state.url_path.as_deref()),
-        };
+            ack_timeout,
+            lifecycle,
+        )
+        .await
+    }
+
+    async fn send_confirmed_stream_control(
+        &self,
+        connection: &Arc<WebsocketConnection>,
+        control: ConfirmedStreamControl<'_>,
+        request_id: u32,
+        ack_timeout: Duration,
+        lifecycle: Arc<StreamSubscriptionLifecycle>,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        let mut state = connection.state.lock().await;
+        let context = control.context(connection, &state, request_id);
         lifecycle.set_context(context.clone());
+        if !control.exact_session_is_current(connection, &state) {
+            drop(state);
+            if control.emit_pre_dispatch_terminal() {
+                lifecycle.emit_terminal(
+                    &self.stream_subscription_events,
+                    context.clone(),
+                    StreamSubscriptionOutcome::SessionReplaced,
+                );
+            }
+            return Err(StreamSubscriptionError::SessionReplaced { context });
+        }
+
         let payload = json!({
-            "method": "SUBSCRIBE",
-            "params": streams,
+            "method": control.method.method(),
+            "params": control.params,
             "id": request_id,
         });
         let Ok(message) = serde_json::to_string(&payload) else {
+            drop(state);
+            if control.emit_pre_dispatch_terminal() {
+                lifecycle.emit_terminal(
+                    &self.stream_subscription_events,
+                    context.clone(),
+                    StreamSubscriptionOutcome::ProtocolError,
+                );
+            }
             return Err(StreamSubscriptionError::Protocol { context });
         };
+
+        #[cfg(feature = "derivatives_trading_usds_futures")]
+        if matches!(
+            control.pending_ownership(),
+            PendingStreamSubscriptionOwnership::CallerManaged
+        ) {
+            let stale_caller_managed = state
+                .pending_stream_subscriptions
+                .get(&request_id)
+                .is_some_and(|pending| {
+                    pending.ownership == PendingStreamSubscriptionOwnership::CallerManaged
+                        && pending.context.session_generation != context.session_generation
+                });
+            if stale_caller_managed {
+                let (pending, terminal_claimed) = state
+                    .remove_pending_stream_subscription(request_id, true)
+                    .expect("matched stale caller-managed request must still be pending");
+                let stale_context = pending.context.clone();
+                let _ = pending
+                    .completion
+                    .send(Err(StreamSubscriptionError::SessionReplaced {
+                        context: stale_context.clone(),
+                    }));
+                if terminal_claimed {
+                    StreamSubscriptionLifecycle::emit_claimed(
+                        &self.stream_subscription_events,
+                        stale_context,
+                        StreamSubscriptionOutcome::SessionReplaced,
+                    );
+                }
+            }
+        }
 
         if state.pending_stream_subscriptions.contains_key(&request_id)
             || state
                 .stream_request_id_generations
                 .get(&request_id)
-                .is_some_and(|used_generation| *used_generation == session_generation)
+                .is_some_and(|used_generation| *used_generation == context.session_generation)
         {
+            drop(state);
+            if control.emit_pre_dispatch_terminal() {
+                lifecycle.emit_terminal(
+                    &self.stream_subscription_events,
+                    context.clone(),
+                    StreamSubscriptionOutcome::ProtocolError,
+                );
+            }
             return Err(StreamSubscriptionError::DuplicateRequestId { context });
         }
+
+        let (stream_keys, was_confirmed, unconfirmed_reservation_token, parameter_label) =
+            match &control.ownership {
+                ConfirmedStreamControlOwnership::SdkManaged {
+                    unconfirmed_reservation_token,
+                } => {
+                    let stream_keys = control
+                        .params
+                        .iter()
+                        .map(|stream| self.stream_key(stream, state.url_path.as_deref()))
+                        .collect::<Vec<_>>();
+                    let was_confirmed = stream_keys
+                        .iter()
+                        .all(|key| state.confirmed_stream_keys.contains(key));
+                    let owns_unconfirmed_reservation =
+                        unconfirmed_reservation_token.is_some_and(|token| {
+                            stream_keys.iter().all(|key| {
+                                state
+                                    .unconfirmed_stream_reservations
+                                    .get(key)
+                                    .is_some_and(|current| *current == token)
+                            })
+                        });
+                    if !was_confirmed && !owns_unconfirmed_reservation {
+                        drop(state);
+                        return Err(StreamSubscriptionError::SessionReplaced { context });
+                    }
+                    (
+                        stream_keys,
+                        was_confirmed,
+                        *unconfirmed_reservation_token,
+                        "stream(s)",
+                    )
+                }
+                #[cfg(feature = "derivatives_trading_usds_futures")]
+                ConfirmedStreamControlOwnership::CallerManaged { .. } => {
+                    (Vec::new(), true, None, "topic(s)")
+                }
+            };
 
         let token = self
             .next_stream_pending_token
             .fetch_add(1, Ordering::Relaxed);
         let (completion, receiver) = oneshot::channel();
-        let stream_keys = streams
-            .iter()
-            .map(|stream| self.stream_key(stream, state.url_path.as_deref()))
-            .collect::<Vec<_>>();
-        let was_confirmed = stream_keys
-            .iter()
-            .all(|key| state.confirmed_stream_keys.contains(key));
-        let owns_unconfirmed_reservation = unconfirmed_reservation_token.is_some_and(|token| {
-            stream_keys.iter().all(|key| {
-                state
-                    .unconfirmed_stream_reservations
-                    .get(key)
-                    .is_some_and(|current| *current == token)
-            })
-        });
-        if !was_confirmed && !owns_unconfirmed_reservation {
-            return Err(StreamSubscriptionError::SessionReplaced { context });
-        }
         state.pending_stream_subscriptions.insert(
             request_id,
             PendingStreamSubscription {
                 token,
                 context: context.clone(),
+                #[cfg(feature = "derivatives_trading_usds_futures")]
+                ownership: control.pending_ownership(),
                 stream_keys: stream_keys.clone(),
                 was_confirmed,
                 unconfirmed_reservation_token,
@@ -3336,10 +3751,10 @@ impl WebsocketStreams {
         );
         state
             .stream_request_id_generations
-            .insert(request_id, session_generation);
+            .insert(request_id, context.session_generation);
         lifecycle.emit_dispatched(&self.stream_subscription_events, &context);
         let writer = state.ws_write_tx.clone().filter(|_| {
-            state.writer_session_generation == Some(session_generation)
+            state.writer_session_generation == Some(context.session_generation)
                 && !state.reconnection_pending
                 && !state.close_initiated
         });
@@ -3349,8 +3764,10 @@ impl WebsocketStreams {
         if dispatch_failed {
             let (pending, terminal_claimed) = state
                 .remove_pending_stream_subscription(request_id, true)
-                .expect("just-inserted subscription request must still be pending");
-            if state.stream_request_id_generations.get(&request_id) == Some(&session_generation) {
+                .expect("just-inserted confirmed control request must still be pending");
+            if state.stream_request_id_generations.get(&request_id)
+                == Some(&context.session_generation)
+            {
                 state.stream_request_id_generations.remove(&request_id);
             }
             drop(state);
@@ -3371,10 +3788,12 @@ impl WebsocketStreams {
         drop(state);
 
         info!(
-            "SUBSCRIBE {} stream(s) on connection {} generation {} for scope {} with request id {}",
-            streams.len(),
+            "{} {} {} on connection {} generation {} for scope {} with request id {}",
+            control.method.method(),
+            control.params.len(),
+            parameter_label,
             connection.id,
-            session_generation,
+            context.session_generation,
             redacted_path_scope(path_scope.as_deref()),
             request_id
         );
@@ -3605,6 +4024,20 @@ impl WebsocketStreams {
             return format!(
                 "{}/private/stream",
                 self.configuration.ws_url.as_deref().unwrap_or("")
+            );
+        }
+
+        if streams.is_empty() && matches!(url_path, Some("public" | "market")) {
+            // A caller using confirmed routed JSON controls owns the complete
+            // desired set. Open the documented combined-stream route without
+            // URL subscriptions, preserving combined response envelopes while
+            // avoiding an empty `?streams=` subscription or double initial
+            // ownership. Binance's live-control protocol then supplies the
+            // first SUBSCRIBE explicitly.
+            return format!(
+                "{}/{}/stream",
+                self.configuration.ws_url.as_deref().unwrap_or(""),
+                url_path.expect("matched routed path")
             );
         }
 
@@ -4413,6 +4846,8 @@ mod tests {
     use crate::errors::{
         StreamSubscriptionError, WebsocketConnectionFailureReason, WebsocketError,
     };
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    use crate::models::{RoutedStreamScope, RoutedStreamTarget};
     use crate::models::{
         StreamId, StreamSubscriptionEvent, StreamSubscriptionOutcome, StreamSubscriptionScope,
         TimeUnit,
@@ -9974,6 +10409,22 @@ mod tests {
             }
 
             #[test]
+            fn empty_routed_json_control_uses_query_free_exact_route() {
+                TOKIO_SHARED_RT.block_on(async {
+                    let ws =
+                        create_websocket_streams(Some("wss://fstream.binance.com"), None, None);
+                    assert_eq!(
+                        ws.prepare_url(&[], Some("public")),
+                        "wss://fstream.binance.com/public/stream"
+                    );
+                    assert_eq!(
+                        ws.prepare_url(&[], Some("market")),
+                        "wss://fstream.binance.com/market/stream"
+                    );
+                });
+            }
+
+            #[test]
             fn without_time_unit_returns_base_url() {
                 TOKIO_SHARED_RT.block_on(async {
                     let conns = vec![
@@ -11985,6 +12436,667 @@ mod tests {
                             .is_empty()
                     );
                 });
+            }
+
+            #[cfg(feature = "derivatives_trading_usds_futures")]
+            mod routed_control {
+                use super::*;
+
+                async fn setup_routed_connection(
+                    scope: RoutedStreamScope,
+                    generation: u64,
+                ) -> (
+                    Arc<WebsocketStreams>,
+                    Arc<WebsocketConnection>,
+                    tokio::sync::mpsc::UnboundedReceiver<Message>,
+                ) {
+                    let config = ConfigurationWebsocketStreams {
+                        ws_url: Some("wss://fstream.binance.com".to_string()),
+                        mode: WebsocketMode::Single,
+                        reconnect_delay: 500,
+                        time_unit: None,
+                        raw_frame_observer: None,
+                        stream_subscription_observer: None,
+                        agent: None,
+                        user_agent: build_user_agent("confirmed-routed-test"),
+                    };
+                    let ws = WebsocketStreams::new(
+                        config,
+                        vec![WebsocketConnection::new("routed-c1")],
+                        vec![],
+                    );
+                    let connection = ws.common.connection_pool[0].clone();
+                    let (writer, receiver) = unbounded_channel();
+                    connection
+                        .session_generation
+                        .store(generation, Ordering::Release);
+                    {
+                        let mut state = connection.state.lock().await;
+                        state.url_path = Some(scope.as_path_scope().to_string());
+                        state.ws_write_tx = Some(writer);
+                        state.writer_session_generation = Some(generation);
+                        state.reconnection_pending = false;
+                        state.close_initiated = false;
+                    }
+                    (ws, connection, receiver)
+                }
+
+                fn target(
+                    connection: &WebsocketConnection,
+                    generation: u64,
+                    scope: RoutedStreamScope,
+                ) -> RoutedStreamTarget {
+                    RoutedStreamTarget::new(connection.id.clone(), generation, scope)
+                }
+
+                #[test]
+                fn subscribe_and_unsubscribe_are_sorted_numeric_confirmed_and_ownerless() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Public, 7).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+                        let subscribe = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 7, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec![
+                                        "ethusdt@depth".to_string(),
+                                        "btcusdt@depth".to_string(),
+                                        "ethusdt@depth".to_string(),
+                                    ],
+                                    700,
+                                    Duration::from_millis(200),
+                                )
+                                .await
+                            })
+                        };
+
+                        let payload = next_text(&mut writes).await;
+                        assert_eq!(payload["method"], "SUBSCRIBE");
+                        assert_eq!(payload["params"], json!(["btcusdt@depth", "ethusdt@depth"]));
+                        assert_eq!(payload["id"].as_u64(), Some(700));
+                        assert!(payload["id"].is_number());
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": 700}).to_string(),
+                            connection.clone(),
+                            7,
+                        )
+                        .await;
+                        let ack = subscribe.await.unwrap().unwrap();
+                        assert_eq!(ack.context.connection_id, connection.id);
+                        assert_eq!(ack.context.session_generation, 7);
+                        assert_eq!(ack.context.request_id, 700);
+                        assert_eq!(ack.context.path_scope, StreamSubscriptionScope::Public);
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Acknowledged
+                        );
+
+                        {
+                            let state = connection.state.lock().await;
+                            assert!(state.stream_callbacks.is_empty());
+                            assert!(state.confirmed_stream_keys.is_empty());
+                            assert!(state.pending_subscriptions.is_empty());
+                        }
+                        assert!(ws.connection_streams.lock().await.is_empty());
+                        assert_eq!(
+                            ws.get_reconnect_url(String::new(), connection.clone())
+                                .await,
+                            "wss://fstream.binance.com/public/stream"
+                        );
+
+                        let unsubscribe = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 7, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.unsubscribe_routed_confirmed(
+                                    target,
+                                    vec!["ethusdt@depth".to_string(), "btcusdt@depth".to_string()],
+                                    701,
+                                    Duration::from_millis(200),
+                                )
+                                .await
+                            })
+                        };
+                        let payload = next_text(&mut writes).await;
+                        assert_eq!(payload["method"], "UNSUBSCRIBE");
+                        assert_eq!(payload["params"], json!(["btcusdt@depth", "ethusdt@depth"]));
+                        assert_eq!(payload["id"].as_u64(), Some(701));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": 701}).to_string(),
+                            connection.clone(),
+                            7,
+                        )
+                        .await;
+                        unsubscribe.await.unwrap().unwrap();
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Acknowledged
+                        );
+
+                        connection.session_generation.store(8, Ordering::Release);
+                        {
+                            let mut state = connection.state.lock().await;
+                            state.writer_session_generation = Some(8);
+                        }
+                        ws.on_open(
+                            "wss://fstream.binance.com/public/stream".to_string(),
+                            connection,
+                        )
+                        .await;
+                        assert!(
+                            writes.try_recv().is_err(),
+                            "SDK replayed an application-owned routed subscription"
+                        );
+                    });
+                }
+
+                #[test]
+                fn duplicate_request_id_is_a_terminal_protocol_error() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Public, 10).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+                        let first = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 10, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@depth".to_string()],
+                                    100,
+                                    Duration::from_millis(200),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": 100}).to_string(),
+                            connection.clone(),
+                            10,
+                        )
+                        .await;
+                        first.await.unwrap().unwrap();
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Acknowledged
+                        );
+
+                        let duplicate = ws
+                            .subscribe_routed_confirmed(
+                                target(&connection, 10, RoutedStreamScope::Public),
+                                vec!["ethusdt@depth".to_string()],
+                                100,
+                                Duration::from_millis(200),
+                            )
+                            .await;
+                        assert!(matches!(
+                            duplicate,
+                            Err(StreamSubscriptionError::DuplicateRequestId { .. })
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::ProtocolError
+                        );
+                        assert!(writes.try_recv().is_err());
+                    });
+                }
+
+                #[test]
+                fn ack_requires_exact_connection_generation_scope_and_request() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Market, 5).await;
+                        let request = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 5, RoutedStreamScope::Market);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@aggTrade".to_string()],
+                                    u32::MAX,
+                                    Duration::from_millis(200),
+                                )
+                                .await
+                            })
+                        };
+                        let payload = next_text(&mut writes).await;
+                        assert_eq!(payload["id"].as_u64(), Some(u64::from(u32::MAX)));
+
+                        let other_connection = WebsocketConnection::new("other-routed-c1");
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": u32::MAX}).to_string(),
+                            other_connection,
+                            5,
+                        )
+                        .await;
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": u32::MAX}).to_string(),
+                            connection.clone(),
+                            4,
+                        )
+                        .await;
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": u32::MAX - 1}).to_string(),
+                            connection.clone(),
+                            5,
+                        )
+                        .await;
+                        tokio::task::yield_now().await;
+                        assert!(!request.is_finished());
+
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": u32::MAX}).to_string(),
+                            connection,
+                            5,
+                        )
+                        .await;
+                        let ack = request.await.unwrap().unwrap();
+                        assert_eq!(ack.context.request_id, u32::MAX);
+                        assert_eq!(ack.context.path_scope, StreamSubscriptionScope::Market);
+                    });
+                }
+
+                #[test]
+                fn stale_scope_and_invalid_topics_fail_before_dispatch() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Public, 2).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+
+                        let stale = ws
+                            .subscribe_routed_confirmed(
+                                target(&connection, 2, RoutedStreamScope::Market),
+                                vec!["btcusdt@depth".to_string()],
+                                20,
+                                Duration::from_millis(20),
+                            )
+                            .await
+                            .unwrap_err();
+                        assert!(matches!(
+                            stale,
+                            StreamSubscriptionError::SessionReplaced { .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::SessionReplaced
+                        );
+
+                        let invalid = ws
+                            .subscribe_routed_confirmed(
+                                target(&connection, 2, RoutedStreamScope::Public),
+                                vec![String::new()],
+                                21,
+                                Duration::from_millis(20),
+                            )
+                            .await
+                            .unwrap_err();
+                        assert!(matches!(invalid, StreamSubscriptionError::Protocol { .. }));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::ProtocolError
+                        );
+                        assert!(writes.try_recv().is_err());
+                    });
+                }
+
+                #[test]
+                fn correlated_reject_and_protocol_error_are_terminal() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Public, 3).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+
+                        let rejected = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 3, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@depth".to_string()],
+                                    30,
+                                    Duration::from_millis(200),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        ws.on_message_with_session(
+                            json!({"code": 2, "msg": "invalid request", "id": 30}).to_string(),
+                            connection.clone(),
+                            3,
+                        )
+                        .await;
+                        assert!(matches!(
+                            rejected.await.unwrap().unwrap_err(),
+                            StreamSubscriptionError::Rejected { code: 2, .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Rejected { code: 2 }
+                        );
+
+                        let protocol = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 3, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.unsubscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@depth".to_string()],
+                                    31,
+                                    Duration::from_millis(200),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        ws.on_message_with_session(
+                            json!({"result": true, "id": 31}).to_string(),
+                            connection,
+                            3,
+                        )
+                        .await;
+                        assert!(matches!(
+                            protocol.await.unwrap().unwrap_err(),
+                            StreamSubscriptionError::Protocol { .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::ProtocolError
+                        );
+                    });
+                }
+
+                #[test]
+                fn timeout_and_dispatch_failure_are_terminal() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Market, 4).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+                        let timed_out = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 4, RoutedStreamScope::Market);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@markPrice".to_string()],
+                                    40,
+                                    Duration::from_millis(20),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        assert!(matches!(
+                            timed_out.await.unwrap().unwrap_err(),
+                            StreamSubscriptionError::Timeout { .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::TimedOut
+                        );
+
+                        drop(writes);
+                        let failed = ws
+                            .subscribe_routed_confirmed(
+                                target(&connection, 4, RoutedStreamScope::Market),
+                                vec!["ethusdt@markPrice".to_string()],
+                                41,
+                                Duration::from_millis(20),
+                            )
+                            .await
+                            .unwrap_err();
+                        assert!(matches!(
+                            failed,
+                            StreamSubscriptionError::NotConnected { .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::DispatchFailed
+                        );
+                    });
+                }
+
+                #[test]
+                fn pending_request_observes_session_replacement() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Public, 6).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+                        let request = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 6, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@depth".to_string()],
+                                    60,
+                                    Duration::from_secs(30),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+
+                        connection.session_generation.store(7, Ordering::Release);
+                        {
+                            let mut state = connection.state.lock().await;
+                            state.writer_session_generation = Some(7);
+                        }
+                        ws.on_open(
+                            "wss://fstream.binance.com/public/stream".to_string(),
+                            connection,
+                        )
+                        .await;
+                        assert!(matches!(
+                            request.await.unwrap().unwrap_err(),
+                            StreamSubscriptionError::SessionReplaced { .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::SessionReplaced
+                        );
+                    });
+                }
+
+                #[test]
+                fn new_generation_reuses_caller_id_before_open_cleanup() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Public, 11).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+                        let first = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 11, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@depth".to_string()],
+                                    110,
+                                    Duration::from_secs(30),
+                                )
+                                .await
+                            })
+                        };
+                        let first_payload = next_text(&mut writes).await;
+                        assert_eq!(first_payload["id"].as_u64(), Some(110));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+
+                        // The transport publishes Open for generation 12 before
+                        // WebsocketStreams::on_open gets to drain generation 11.
+                        // A synchronous Open observer may immediately reissue its
+                        // caller-owned desired set with the same numeric id.
+                        connection.session_generation.store(12, Ordering::Release);
+                        {
+                            let mut state = connection.state.lock().await;
+                            state.writer_session_generation = Some(12);
+                        }
+                        let second = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 12, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["ethusdt@depth".to_string()],
+                                    110,
+                                    Duration::from_secs(30),
+                                )
+                                .await
+                            })
+                        };
+                        let second_payload = next_text(&mut writes).await;
+                        assert_eq!(second_payload["id"].as_u64(), Some(110));
+                        assert!(matches!(
+                            first.await.unwrap().unwrap_err(),
+                            StreamSubscriptionError::SessionReplaced { .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::SessionReplaced
+                        );
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+
+                        // A response still arriving from generation 11 cannot
+                        // complete the generation-12 owner of the same wire id.
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": 110}).to_string(),
+                            connection.clone(),
+                            11,
+                        )
+                        .await;
+                        tokio::task::yield_now().await;
+                        assert!(!second.is_finished());
+
+                        ws.on_message_with_session(
+                            json!({"result": null, "id": 110}).to_string(),
+                            connection,
+                            12,
+                        )
+                        .await;
+                        let ack = second.await.unwrap().unwrap();
+                        assert_eq!(ack.context.session_generation, 12);
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Acknowledged
+                        );
+                    });
+                }
+
+                #[test]
+                fn pending_request_observes_disconnect() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Market, 8).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+                        let request = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 8, RoutedStreamScope::Market);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@aggTrade".to_string()],
+                                    80,
+                                    Duration::from_secs(30),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        ws.disconnect().await.unwrap();
+                        assert!(matches!(
+                            request.await.unwrap().unwrap_err(),
+                            StreamSubscriptionError::Disconnected { .. }
+                        ));
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Disconnected
+                        );
+                    });
+                }
+
+                #[test]
+                fn cancelled_waiter_removes_only_exact_pending_control() {
+                    TOKIO_SHARED_RT.block_on(async {
+                        let (ws, connection, mut writes) =
+                            setup_routed_connection(RoutedStreamScope::Public, 9).await;
+                        let (_subscription, mut events) = observe_subscription_events(&ws);
+                        let request = {
+                            let ws = ws.clone();
+                            let target = target(&connection, 9, RoutedStreamScope::Public);
+                            tokio::spawn(async move {
+                                ws.subscribe_routed_confirmed(
+                                    target,
+                                    vec!["btcusdt@depth".to_string()],
+                                    90,
+                                    Duration::from_secs(30),
+                                )
+                                .await
+                            })
+                        };
+                        let _ = next_text(&mut writes).await;
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Dispatched
+                        );
+                        request.abort();
+                        assert!(request.await.unwrap_err().is_cancelled());
+                        assert_eq!(
+                            next_event(&mut events).await.outcome,
+                            StreamSubscriptionOutcome::Cancelled
+                        );
+                        let state = connection.state.lock().await;
+                        assert!(!state.pending_stream_subscriptions.contains_key(&90));
+                        assert_eq!(state.stream_request_id_generations.get(&90), Some(&9));
+                        assert!(state.confirmed_stream_keys.is_empty());
+                        assert!(state.stream_callbacks.is_empty());
+                    });
+                }
             }
         }
 

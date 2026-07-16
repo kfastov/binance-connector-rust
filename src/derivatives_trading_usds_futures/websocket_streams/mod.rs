@@ -26,7 +26,8 @@ use crate::common::websocket::{
     create_stream_handler, create_stream_handler_confirmed,
 };
 use crate::models::{
-    StreamId, StreamSubscriptionAck, StreamSubscriptionEvent, WebsocketEvent, WebsocketMode,
+    RoutedStreamScope, RoutedStreamTarget, StreamId, StreamSubscriptionAck,
+    StreamSubscriptionEvent, WebsocketEvent, WebsocketMode,
 };
 
 mod apis;
@@ -40,10 +41,52 @@ pub use models::*;
 const HAS_TIME_UNIT: bool = false;
 const USER_DATA_SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One generated USD-M WebSocket route owned by an exact stream client.
+///
+/// The closed enum prevents arbitrary paths, query strings, or credentials
+/// from entering connection selection. Each [`WebsocketStreamsHandle::connect_scope`]
+/// call creates one independent client with one physical connection slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsdMStreamConnectionScope {
+    Public,
+    Market,
+    Private,
+}
+
+impl UsdMStreamConnectionScope {
+    fn as_path_scope(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Market => "market",
+            Self::Private => "private",
+        }
+    }
+
+    fn routed_scope(self) -> Option<RoutedStreamScope> {
+        match self {
+            Self::Public => Some(RoutedStreamScope::Public),
+            Self::Market => Some(RoutedStreamScope::Market),
+            Self::Private => None,
+        }
+    }
+}
+
+/// Read-only identity of the sole physical slot owned by an exact-scope client.
+///
+/// `connection_id` remains stable across reconnects; `session_generation`
+/// advances for each newly opened physical session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsdMStreamConnectionIdentity {
+    pub connection_id: String,
+    pub session_generation: u64,
+    pub scope: UsdMStreamConnectionScope,
+}
+
 pub struct WebsocketStreams {
     websocket_streams_base: Arc<WebsocketStreamsBase>,
     market_api_client: MarketApiClient,
     public_api_client: PublicApiClient,
+    connection_scope: Option<UsdMStreamConnectionScope>,
 }
 
 impl WebsocketStreams {
@@ -73,11 +116,66 @@ impl WebsocketStreams {
 
         websocket_streams_base.clone().connect(streams).await?;
 
-        Ok(Self {
+        Ok(Self::from_base(websocket_streams_base, None))
+    }
+
+    pub(crate) async fn connect_scope(
+        mut config: ConfigurationWebsocketStreams,
+        scope: UsdMStreamConnectionScope,
+    ) -> anyhow::Result<Self> {
+        config.mode = WebsocketMode::Single;
+        if !HAS_TIME_UNIT {
+            config.time_unit = None;
+        }
+        let websocket_streams_base =
+            WebsocketStreamsBase::new(config, vec![], vec![scope.as_path_scope().to_string()]);
+        websocket_streams_base.clone().connect(Vec::new()).await?;
+
+        Ok(Self::from_base(websocket_streams_base, Some(scope)))
+    }
+
+    fn from_base(
+        websocket_streams_base: Arc<WebsocketStreamsBase>,
+        connection_scope: Option<UsdMStreamConnectionScope>,
+    ) -> Self {
+        Self {
             websocket_streams_base: websocket_streams_base.clone(),
             market_api_client: MarketApiClient::new(websocket_streams_base.clone()),
             public_api_client: PublicApiClient::new(websocket_streams_base.clone()),
+            connection_scope,
+        }
+    }
+
+    /// Returns the current physical identity for an exact-scope client.
+    ///
+    /// Generic clients created by [`WebsocketStreamsHandle::connect`] return
+    /// `None`, as do exact clients before their first physical session opens.
+    #[must_use]
+    pub fn connection_identity(&self) -> Option<UsdMStreamConnectionIdentity> {
+        let scope = self.connection_scope?;
+        let (connection_id, session_generation) =
+            self.websocket_streams_base.single_connection_identity()?;
+        (session_generation != 0).then_some(UsdMStreamConnectionIdentity {
+            connection_id,
+            session_generation,
+            scope,
         })
+    }
+
+    /// Returns an exact routed target for public/market JSON controls.
+    ///
+    /// Private exact-scope clients return `None`; use
+    /// [`Self::connection_identity`] to correlate their confirmed user-data
+    /// flow with lifecycle observations.
+    #[must_use]
+    pub fn routed_target(&self) -> Option<RoutedStreamTarget> {
+        let identity = self.connection_identity()?;
+        let path_scope = identity.scope.routed_scope()?;
+        Some(RoutedStreamTarget::new(
+            identity.connection_id,
+            identity.session_generation,
+            path_scope,
+        ))
     }
 
     /// Subscribes to WebSocket events with a provided callback function.
@@ -141,6 +239,69 @@ impl WebsocketStreams {
     {
         self.websocket_streams_base
             .subscribe_on_stream_subscription_events(callback)
+    }
+
+    /// Confirms a live JSON `SUBSCRIBE` on one exact `/public` or `/market`
+    /// physical session.
+    ///
+    /// Binance requires an unsigned integer request `id` and acknowledges the
+    /// exact request with `{ "result": null, "id": ... }`. Topics are sorted
+    /// and deduplicated before encoding. The caller supplies and owns the
+    /// monotonically increasing `request_id`; the SDK never substitutes a
+    /// random value.
+    ///
+    /// This primitive does not register SDK desired-stream ownership and does
+    /// not replay subscriptions after reconnect. Connect with an empty initial
+    /// stream list, observe routed `Open` lifecycle events, then reissue the
+    /// application-owned desired set against each new [`RoutedStreamTarget`].
+    /// This prevents URL subscriptions and JSON controls from competing for
+    /// initial or reconnect ownership.
+    ///
+    /// See the official [live subscription
+    /// protocol](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Live-Subscribing-Unsubscribing-to-streams)
+    /// and [routed endpoint
+    /// migration](https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Important-WebSocket-Change-Notice).
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted [`StreamSubscriptionError`] for stale targets,
+    /// dispatch failures, exact correlated rejects, protocol violations,
+    /// timeout, disconnect, or physical-session replacement.
+    pub async fn subscribe_routed_confirmed(
+        &self,
+        target: RoutedStreamTarget,
+        topics: Vec<String>,
+        request_id: u32,
+        ack_timeout: Duration,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        self.websocket_streams_base
+            .subscribe_routed_confirmed(target, topics, request_id, ack_timeout)
+            .await
+    }
+
+    /// Confirms a live JSON `UNSUBSCRIBE` on one exact `/public` or `/market`
+    /// physical session.
+    ///
+    /// The same caller-owned desired-set and monotonically increasing numeric
+    /// request-id rules as [`Self::subscribe_routed_confirmed`] apply. The SDK
+    /// sends topics in deterministic sorted order and does not mutate or replay
+    /// application subscription ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted [`StreamSubscriptionError`] under the exact
+    /// correlation and terminal-outcome rules described by
+    /// [`Self::subscribe_routed_confirmed`].
+    pub async fn unsubscribe_routed_confirmed(
+        &self,
+        target: RoutedStreamTarget,
+        topics: Vec<String>,
+        request_id: u32,
+        ack_timeout: Duration,
+    ) -> Result<StreamSubscriptionAck, StreamSubscriptionError> {
+        self.websocket_streams_base
+            .unsubscribe_routed_confirmed(target, topics, request_id, ack_timeout)
+            .await
     }
 
     /// Disconnects the WebSocket connection.

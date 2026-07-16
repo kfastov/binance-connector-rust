@@ -240,6 +240,88 @@ pub enum StreamSubscriptionScope {
     Other,
 }
 
+/// Routed USD-M public stream endpoint accepted by confirmed JSON control
+/// requests.
+///
+/// The closed enum prevents a caller-controlled path, URL, or query string
+/// from becoming part of transport selection or diagnostics.
+#[cfg(feature = "derivatives_trading_usds_futures")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutedStreamScope {
+    Public,
+    Market,
+}
+
+#[cfg(feature = "derivatives_trading_usds_futures")]
+impl RoutedStreamScope {
+    /// Returns the generated routed path used by the USD-M stream transport.
+    #[must_use]
+    pub fn as_path_scope(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Market => "market",
+        }
+    }
+
+    /// Parses a generated, already-redacted lifecycle path scope.
+    #[must_use]
+    pub fn from_path_scope(scope: Option<&str>) -> Option<Self> {
+        match scope {
+            Some("public") => Some(Self::Public),
+            Some("market") => Some(Self::Market),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn subscription_scope(self) -> StreamSubscriptionScope {
+        match self {
+            Self::Public => StreamSubscriptionScope::Public,
+            Self::Market => StreamSubscriptionScope::Market,
+        }
+    }
+}
+
+/// Exact physical routed WebSocket session on which to dispatch a confirmed
+/// public stream control request.
+///
+/// Construct this target from an `Open` lifecycle observation. A target stops
+/// being valid when the same connection slot opens a newer
+/// `session_generation`.
+#[cfg(feature = "derivatives_trading_usds_futures")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedStreamTarget {
+    pub connection_id: String,
+    pub session_generation: u64,
+    pub path_scope: RoutedStreamScope,
+}
+
+#[cfg(feature = "derivatives_trading_usds_futures")]
+impl RoutedStreamTarget {
+    #[must_use]
+    pub fn new(
+        connection_id: impl Into<String>,
+        session_generation: u64,
+        path_scope: RoutedStreamScope,
+    ) -> Self {
+        Self {
+            connection_id: connection_id.into(),
+            session_generation,
+            path_scope,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn subscription_context(&self, request_id: u32) -> StreamSubscriptionContext {
+        StreamSubscriptionContext {
+            connection_id: self.connection_id.clone(),
+            session_generation: self.session_generation,
+            request_id,
+            path_scope: self.path_scope.subscription_scope(),
+        }
+    }
+}
+
 /// Identifies one JSON stream-subscription request on one physical WebSocket
 /// session. It intentionally contains no stream name: private stream names may
 /// contain a listen key and must not leak through diagnostics.
