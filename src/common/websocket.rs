@@ -573,7 +573,7 @@ pub struct WebsocketCommon {
     user_agent: Option<String>,
     raw_frame_observer: Option<RawFrameObserver>,
     /// Whether this SDK runtime may replace physical sessions on its own.
-    /// Exact routed USD-M clients switch this off before their first handshake
+    /// Exact-scope USD-M clients switch this off before their first handshake
     /// so the connector can own backoff, jitter, silence recovery and replay.
     automatic_session_replacement: AtomicBool,
     #[cfg(test)]

@@ -45,7 +45,8 @@ const USER_DATA_SUBSCRIPTION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// The closed enum prevents arbitrary paths, query strings, or credentials
 /// from entering connection selection. Each [`WebsocketStreamsHandle::connect_scope`]
-/// call creates one independent client with one physical connection slot.
+/// call creates one independent caller-replaced client with one physical
+/// connection slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsdMStreamConnectionScope {
     Public,
@@ -73,8 +74,10 @@ impl UsdMStreamConnectionScope {
 
 /// Read-only identity of the sole physical slot owned by an exact-scope client.
 ///
-/// `connection_id` remains stable across reconnects; `session_generation`
-/// advances for each newly opened physical session.
+/// `connection_id` and `session_generation` identify the sole, most recently
+/// opened physical session. The identity remains available after terminal
+/// lifecycle evidence so the caller can correlate that evidence; exact clients
+/// do not replace the session internally, and the caller creates a new client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsdMStreamConnectionIdentity {
     pub connection_id: String,
@@ -129,17 +132,13 @@ impl WebsocketStreams {
         }
         let websocket_streams_base =
             WebsocketStreamsBase::new(config, vec![], vec![scope.as_path_scope().to_string()]);
-        if matches!(
-            scope,
-            UsdMStreamConnectionScope::Public | UsdMStreamConnectionScope::Market
-        ) {
-            // The connector contract owns retry timing, silence recovery and
-            // desired-set replay for routed market-data sessions. Private and
-            // generic SDK clients retain the SDK's historical recovery policy.
-            websocket_streams_base
-                .common
-                .use_caller_managed_session_replacement();
-        }
+        // The connector contract owns retry timing, silence recovery and
+        // subscription replay for every exact physical session, including
+        // private user-data sessions. Generic SDK clients retain the SDK's
+        // historical recovery policy.
+        websocket_streams_base
+            .common
+            .use_caller_managed_session_replacement();
         if let Err(error) = websocket_streams_base.clone().connect(Vec::new()).await {
             // `connect` installs the generated handler before the handshake.
             // A failed handshake therefore needs the same terminal cleanup as
@@ -164,7 +163,7 @@ impl WebsocketStreams {
         }
     }
 
-    /// Returns the current physical identity for an exact-scope client.
+    /// Returns the most recently opened physical identity for an exact-scope client.
     ///
     /// Generic clients created by [`WebsocketStreamsHandle::connect`] return
     /// `None`, as do exact clients before their first physical session opens.
@@ -563,6 +562,10 @@ impl WebsocketStreams {
     /// Subscribes to all events for one listen key and returns only after the
     /// exact numeric request has been acknowledged on the physical session
     /// identified by the returned context.
+    ///
+    /// An exact private client never reconnects or replays this subscription;
+    /// replace the client and subscribe again after terminal lifecycle evidence.
+    /// Generic clients preserve the SDK-managed reconnect and replay policy.
     ///
     /// The current Binance notice does not define the selected-events JSON item
     /// schema. This method therefore preserves the generated SDK's established

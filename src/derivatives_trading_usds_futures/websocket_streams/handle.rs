@@ -81,8 +81,10 @@ impl WebsocketStreamsHandle {
     /// The client owns one `Single` connection slot and starts with no URL
     /// subscriptions. Public and market callers can then use confirmed routed
     /// JSON controls; private callers can use the confirmed user-data flow.
-    /// Each call returns an independent client and can be closed with its
-    /// existing [`WebsocketStreams::disconnect`] method.
+    /// Exact clients never reconnect, replay, or renew internally: after a
+    /// terminal lifecycle event the caller replaces the client and reissues
+    /// its desired subscriptions. Each call returns an independent client and
+    /// can be closed with its existing [`WebsocketStreams::disconnect`] method.
     ///
     /// # Errors
     ///
@@ -99,7 +101,8 @@ impl WebsocketStreamsHandle {
 mod tests {
     use std::sync::Arc;
 
-    use futures::StreamExt;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
     use tokio::net::TcpListener;
     use tokio::sync::{
         mpsc::{UnboundedReceiver, unbounded_channel},
@@ -107,8 +110,11 @@ mod tests {
     };
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{
-        accept_hdr_async,
-        tungstenite::handshake::server::{Request, Response},
+        accept_async, accept_hdr_async,
+        tungstenite::{
+            Message,
+            handshake::server::{Request, Response},
+        },
     };
 
     use crate::common::config::{
@@ -172,7 +178,7 @@ mod tests {
         )
     }
 
-    async fn assert_routed_scope_does_not_reconnect(scope: UsdMStreamConnectionScope) {
+    async fn assert_market_data_exact_scope_does_not_reconnect(scope: UsdMStreamConnectionScope) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (drop_sender, drop_receiver) = oneshot::channel();
@@ -302,8 +308,8 @@ mod tests {
         assert_eq!(paths.recv().await.as_deref(), Some("/private/stream"));
         let private_identity = private.connection_identity().unwrap();
         assert_eq!(private_identity.scope, UsdMStreamConnectionScope::Private);
-        assert!(private.sdk_manages_session_replacement());
-        assert_eq!(private.renewal_enqueue_count(), 1);
+        assert!(!private.sdk_manages_session_replacement());
+        assert_eq!(private.renewal_enqueue_count(), 0);
         assert_eq!(
             opens.recv().await.unwrap(),
             (
@@ -322,13 +328,13 @@ mod tests {
 
     #[tokio::test]
     async fn routed_exact_scopes_wait_for_caller_managed_replacement() {
-        assert_routed_scope_does_not_reconnect(UsdMStreamConnectionScope::Public).await;
-        assert_routed_scope_does_not_reconnect(UsdMStreamConnectionScope::Market).await;
+        assert_market_data_exact_scope_does_not_reconnect(UsdMStreamConnectionScope::Public).await;
+        assert_market_data_exact_scope_does_not_reconnect(UsdMStreamConnectionScope::Market).await;
     }
 
     #[tokio::test]
-    async fn routed_exact_scopes_do_not_enqueue_sdk_renewal() {
-        let (handle, mut paths, mut opens) = scoped_test_handle(4).await;
+    async fn exact_scopes_do_not_enqueue_sdk_renewal() {
+        let (handle, mut paths, mut opens) = scoped_test_handle(3).await;
         let public = handle
             .connect_scope(UsdMStreamConnectionScope::Public)
             .await
@@ -337,72 +343,80 @@ mod tests {
             .connect_scope(UsdMStreamConnectionScope::Market)
             .await
             .unwrap();
-        let mut opened_paths = vec![paths.recv().await.unwrap(), paths.recv().await.unwrap()];
+        let private = handle
+            .connect_scope(UsdMStreamConnectionScope::Private)
+            .await
+            .unwrap();
+        let mut opened_paths = vec![
+            paths.recv().await.unwrap(),
+            paths.recv().await.unwrap(),
+            paths.recv().await.unwrap(),
+        ];
         opened_paths.sort_unstable();
-        assert_eq!(opened_paths, vec!["/market/stream", "/public/stream"]);
+        assert_eq!(
+            opened_paths,
+            vec!["/market/stream", "/private/stream", "/public/stream"]
+        );
+        assert!(opens.recv().await.is_some());
         assert!(opens.recv().await.is_some());
         assert!(opens.recv().await.is_some());
         let public_identity = public.connection_identity().unwrap();
         let market_identity = market.connection_identity().unwrap();
+        let private_identity = private.connection_identity().unwrap();
         assert_eq!(public.renewal_enqueue_count(), 0);
         assert_eq!(market.renewal_enqueue_count(), 0);
+        assert_eq!(private.renewal_enqueue_count(), 0);
         assert!(opens.try_recv().is_err());
         assert!(paths.try_recv().is_err());
         assert_eq!(public.connection_identity().unwrap(), public_identity);
         assert_eq!(market.connection_identity().unwrap(), market_identity);
+        assert_eq!(private.connection_identity().unwrap(), private_identity);
         public.disconnect().await.unwrap();
         market.disconnect().await.unwrap();
+        private.disconnect().await.unwrap();
     }
 
     #[tokio::test]
-    async fn private_exact_scope_retains_sdk_managed_reconnect() {
+    async fn private_exact_scope_returns_terminal_control_without_reconnect_or_replay() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (drop_sender, drop_receiver) = oneshot::channel();
-        let (path_sender, mut path_receiver) = unbounded_channel();
+        let (subscription_sender, mut subscription_receiver) = unbounded_channel::<Value>();
         let server = tokio::spawn(async move {
             let (first_stream, _) = listener.accept().await.unwrap();
-            let first_path_sender = path_sender.clone();
-            let first = accept_hdr_async(
-                first_stream,
-                move |request: &Request, response: Response| {
-                    first_path_sender
-                        .send(request.uri().path().to_string())
-                        .unwrap();
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
+            let mut first = accept_async(first_stream).await.unwrap();
+            let subscription = timeout(Duration::from_secs(1), first.next())
+                .await
+                .expect("exact private client did not send its subscription")
+                .expect("exact private client closed before its subscription")
+                .expect("exact private subscription frame failed");
+            let Message::Text(subscription) = subscription else {
+                panic!("expected exact private text subscription, got {subscription:?}");
+            };
+            let subscription: Value = serde_json::from_str(&subscription).unwrap();
+            let request_id = subscription["id"]
+                .as_u64()
+                .expect("private subscription id must be numeric");
+            subscription_sender.send(subscription).unwrap();
+            first
+                .send(Message::Text(
+                    json!({"result": null, "id": request_id}).to_string().into(),
+                ))
+                .await
+                .unwrap();
             drop_receiver.await.unwrap();
             drop(first);
 
-            let (second_stream, _) = timeout(Duration::from_secs(1), listener.accept())
+            // A reconnect would also replay the confirmed private desired set.
+            // The caller-managed exact session must return control instead.
+            timeout(Duration::from_millis(250), listener.accept())
                 .await
-                .expect("private exact client did not reconnect")
-                .unwrap();
-            let second = accept_hdr_async(
-                second_stream,
-                move |request: &Request, response: Response| {
-                    path_sender.send(request.uri().path().to_string()).unwrap();
-                    Ok(response)
-                },
-            )
-            .await
-            .unwrap();
-            let mut second = second;
-            while second.next().await.is_some() {}
+                .is_ok()
         });
 
-        let (open_sender, mut open_receiver) = unbounded_channel();
+        let (lifecycle_sender, mut lifecycle_receiver) = unbounded_channel();
         let observer = RawFrameObserver::new_context(|_| {}).with_lifecycle(move |context| {
-            if context.event == WebsocketLifecycleEvent::Open {
-                let _ = open_sender.send((
-                    context.connection_id.to_string(),
-                    context.session_generation,
-                    context.path_scope.map(str::to_string),
-                ));
-            }
+            let _ = lifecycle_sender.send(context.event);
         });
         let configuration = ConfigurationWebsocketStreams::builder()
             .ws_url(format!("ws://{address}"))
@@ -414,37 +428,65 @@ mod tests {
             .connect_scope(UsdMStreamConnectionScope::Private)
             .await
             .unwrap();
-        assert!(private.sdk_manages_session_replacement());
+        assert!(!private.sdk_manages_session_replacement());
+        assert_eq!(private.renewal_enqueue_count(), 0);
         assert_eq!(
-            path_receiver.recv().await.as_deref(),
-            Some("/private/stream")
+            lifecycle_receiver.recv().await,
+            Some(WebsocketLifecycleEvent::Open)
         );
-        let first_open = open_receiver.recv().await.unwrap();
-        drop_sender.send(()).unwrap();
-        assert_eq!(
-            timeout(Duration::from_secs(1), path_receiver.recv())
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("/private/stream")
-        );
-        let second_open = timeout(Duration::from_secs(1), open_receiver.recv())
+        let initial_identity = private.connection_identity().unwrap();
+
+        let (_stream, ack) = private
+            .user_data_confirmed(
+                "fixture-private-listen-key".to_string(),
+                41,
+                Duration::from_secs(1),
+            )
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(second_open.0, first_open.0);
-        assert_eq!(second_open.1, first_open.1 + 1);
-        assert_eq!(second_open.2.as_deref(), Some("private"));
+        assert_eq!(ack.context.request_id, 41);
+        assert_eq!(ack.context.connection_id, initial_identity.connection_id);
         assert_eq!(
-            private.connection_identity().unwrap().session_generation,
-            second_open.1
+            ack.context.session_generation,
+            initial_identity.session_generation
         );
+        let subscription = subscription_receiver.recv().await.unwrap();
+        assert_eq!(subscription["method"], "SUBSCRIBE");
+        assert_eq!(
+            subscription["params"],
+            json!(["fixture-private-listen-key"])
+        );
+        assert_eq!(subscription["id"], 41);
+
+        drop_sender.send(()).unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let event = lifecycle_receiver
+                    .recv()
+                    .await
+                    .expect("private lifecycle ended before terminal callback");
+                if matches!(
+                    event,
+                    WebsocketLifecycleEvent::Close { .. }
+                        | WebsocketLifecycleEvent::ReadError
+                        | WebsocketLifecycleEvent::StreamEnded
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("exact private terminal callback did not return control");
+
+        assert!(
+            !server.await.unwrap(),
+            "exact private client reconnected and could replay its subscription"
+        );
+        assert_eq!(private.connection_identity().unwrap(), initial_identity);
+        assert!(!private.is_connected().await);
+        assert!(subscription_receiver.try_recv().is_err());
 
         private.disconnect().await.unwrap();
-        timeout(Duration::from_secs(1), server)
-            .await
-            .expect("private mock server did not observe terminal disconnect")
-            .unwrap();
     }
 
     #[tokio::test]
