@@ -572,6 +572,12 @@ pub struct WebsocketCommon {
     agent: Option<AgentConnector>,
     user_agent: Option<String>,
     raw_frame_observer: Option<RawFrameObserver>,
+    /// Whether this SDK runtime may replace physical sessions on its own.
+    /// Exact routed USD-M clients switch this off before their first handshake
+    /// so the connector can own backoff, jitter, silence recovery and replay.
+    automatic_session_replacement: AtomicBool,
+    #[cfg(test)]
+    renewal_enqueue_count: AtomicU64,
     terminal_shutdown: AtomicBool,
     terminal_shutdown_tx: watch::Sender<bool>,
     background_tasks: StdMutex<Vec<JoinHandle<()>>>,
@@ -629,6 +635,9 @@ impl WebsocketCommon {
             agent,
             user_agent,
             raw_frame_observer,
+            automatic_session_replacement: AtomicBool::new(true),
+            #[cfg(test)]
+            renewal_enqueue_count: AtomicU64::new(0),
             terminal_shutdown: AtomicBool::new(false),
             terminal_shutdown_tx,
             background_tasks: StdMutex::new(Vec::new()),
@@ -648,6 +657,27 @@ impl WebsocketCommon {
             .extend([reconnect_task, renewal_task]);
 
         common
+    }
+
+    #[cfg(feature = "derivatives_trading_usds_futures")]
+    pub(crate) fn use_caller_managed_session_replacement(&self) {
+        debug_assert!(
+            self.connection_pool
+                .iter()
+                .all(|connection| connection.session_generation.load(Ordering::Acquire) == 0),
+            "session-replacement ownership must be selected before the first handshake"
+        );
+        self.automatic_session_replacement
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn sdk_manages_session_replacement(&self) -> bool {
+        self.automatic_session_replacement.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn renewal_enqueue_count(&self) -> u64 {
+        self.renewal_enqueue_count.load(Ordering::Acquire)
     }
 
     fn register_background_task(&self, task: JoinHandle<()>) {
@@ -806,6 +836,13 @@ impl WebsocketCommon {
                         entry
                     }
                 };
+                if !common.sdk_manages_session_replacement() {
+                    debug!(
+                        "Discarding SDK reconnect for caller-managed connection {} generation {}",
+                        entry.connection_id, entry.session_generation
+                    );
+                    continue;
+                }
                 info!("Scheduling reconnect for id {}", entry.connection_id);
 
                 if let Some(conn_arc) = common
@@ -1569,17 +1606,20 @@ impl WebsocketCommon {
 
         info!("Established {} → {}", conn.id, redacted_websocket_url(url));
 
-        if self
-            .renewal_tx
-            .try_send(RenewalEntry {
+        if self.sdk_manages_session_replacement() {
+            let scheduled = self.renewal_tx.try_send(RenewalEntry {
                 connection_id: conn.id.clone(),
                 session_generation,
                 path_scope: path_scope.clone(),
                 url: url.to_string(),
-            })
-            .is_err()
-        {
-            error!("Failed to schedule renewal for {}", conn.id);
+            });
+            #[cfg(test)]
+            if scheduled.is_ok() {
+                self.renewal_enqueue_count.fetch_add(1, Ordering::AcqRel);
+            }
+            if scheduled.is_err() {
+                error!("Failed to schedule renewal for {}", conn.id);
+            }
         }
 
         let (write_half, mut read_half) = ws.split();
@@ -7789,6 +7829,8 @@ mod tests {
                         agent: None,
                         user_agent: None,
                         raw_frame_observer: Some(observer),
+                        automatic_session_replacement: AtomicBool::new(true),
+                        renewal_enqueue_count: std::sync::atomic::AtomicU64::new(0),
                         terminal_shutdown: AtomicBool::new(false),
                         terminal_shutdown_tx,
                         background_tasks: StdMutex::new(Vec::new()),
@@ -12405,7 +12447,16 @@ mod tests {
 
             #[test]
             fn dispatch_failure_owner_survives_waiter_abort_and_cleans_before_terminal() {
-                TOKIO_SHARED_RT.block_on(async {
+                // This case intentionally blocks inside the synchronous
+                // observer. A dedicated two-worker runtime keeps the test
+                // driver runnable; the crate's shared current-thread runtime
+                // would make the barrier depend on an unrelated parallel test.
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("dispatch-failure test runtime");
+                runtime.block_on(async {
                     let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
                     let dispatch_barrier = Arc::new(std::sync::Barrier::new(2));
                     let (dispatch_entered_tx, dispatch_entered_rx) = std::sync::mpsc::channel();

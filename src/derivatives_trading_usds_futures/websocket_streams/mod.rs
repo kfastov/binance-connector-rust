@@ -129,6 +129,17 @@ impl WebsocketStreams {
         }
         let websocket_streams_base =
             WebsocketStreamsBase::new(config, vec![], vec![scope.as_path_scope().to_string()]);
+        if matches!(
+            scope,
+            UsdMStreamConnectionScope::Public | UsdMStreamConnectionScope::Market
+        ) {
+            // The connector contract owns retry timing, silence recovery and
+            // desired-set replay for routed market-data sessions. Private and
+            // generic SDK clients retain the SDK's historical recovery policy.
+            websocket_streams_base
+                .common
+                .use_caller_managed_session_replacement();
+        }
         if let Err(error) = websocket_streams_base.clone().connect(Vec::new()).await {
             // `connect` installs the generated handler before the handshake.
             // A failed handshake therefore needs the same terminal cleanup as
@@ -349,6 +360,18 @@ impl WebsocketStreams {
     #[cfg(test)]
     fn runtime_weak(&self) -> std::sync::Weak<crate::common::websocket::WebsocketCommon> {
         Arc::downgrade(&self.websocket_streams_base.common)
+    }
+
+    #[cfg(test)]
+    fn sdk_manages_session_replacement(&self) -> bool {
+        self.websocket_streams_base
+            .common
+            .sdk_manages_session_replacement()
+    }
+
+    #[cfg(test)]
+    fn renewal_enqueue_count(&self) -> u64 {
+        self.websocket_streams_base.common.renewal_enqueue_count()
     }
 
     #[cfg(test)]

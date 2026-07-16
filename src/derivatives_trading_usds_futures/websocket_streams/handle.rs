@@ -101,7 +101,10 @@ mod tests {
 
     use futures::StreamExt;
     use tokio::net::TcpListener;
-    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::sync::{
+        mpsc::{UnboundedReceiver, unbounded_channel},
+        oneshot,
+    };
     use tokio::time::{Duration, timeout};
     use tokio_tungstenite::{
         accept_hdr_async,
@@ -169,6 +172,78 @@ mod tests {
         )
     }
 
+    async fn assert_routed_scope_does_not_reconnect(scope: UsdMStreamConnectionScope) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (drop_sender, drop_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let websocket = accept_hdr_async(stream, |_request: &Request, response: Response| {
+                Ok(response)
+            })
+            .await
+            .unwrap();
+            drop_receiver.await.unwrap();
+            drop(websocket);
+
+            // The historical SDK policy would attempt another handshake after
+            // the configured 10 ms reconnect delay.
+            timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let (lifecycle_sender, mut lifecycle_receiver) = unbounded_channel();
+        let observer = RawFrameObserver::new_context(|_| {}).with_lifecycle(move |context| {
+            let _ = lifecycle_sender.send(context.event);
+        });
+        let configuration = ConfigurationWebsocketStreams::builder()
+            .ws_url(format!("ws://{address}"))
+            .reconnect_delay(10_u64)
+            .raw_frame_observer(observer)
+            .build()
+            .unwrap();
+        let client = WebsocketStreamsHandle::new(configuration)
+            .connect_scope(scope)
+            .await
+            .unwrap();
+        assert!(!client.sdk_manages_session_replacement());
+        let initial = client.connection_identity().unwrap();
+        assert_eq!(
+            lifecycle_receiver.recv().await,
+            Some(WebsocketLifecycleEvent::Open)
+        );
+
+        drop_sender.send(()).unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let event = lifecycle_receiver
+                    .recv()
+                    .await
+                    .expect("transport lifecycle ended before disconnect evidence");
+                if matches!(
+                    event,
+                    WebsocketLifecycleEvent::Close { .. }
+                        | WebsocketLifecycleEvent::ReadError
+                        | WebsocketLifecycleEvent::StreamEnded
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("caller-managed route did not observe server disconnect");
+
+        assert!(
+            !server.await.unwrap(),
+            "routed exact client attempted an SDK-managed reconnect"
+        );
+        assert_eq!(client.connection_identity().unwrap(), initial);
+        assert!(!client.is_connected().await);
+        assert!(lifecycle_receiver.try_recv().is_err());
+        client.disconnect().await.unwrap();
+    }
+
     #[tokio::test]
     async fn exact_scope_opens_one_route_and_exposes_matching_identity() {
         let (handle, mut paths, mut opens) = scoped_test_handle(3).await;
@@ -188,6 +263,8 @@ mod tests {
             )
         );
         assert_eq!(public_identity.scope, UsdMStreamConnectionScope::Public);
+        assert!(!public.sdk_manages_session_replacement());
+        assert_eq!(public.renewal_enqueue_count(), 0);
         let public_target = public.routed_target().unwrap();
         assert_eq!(public_target.connection_id, public_identity.connection_id);
         assert_eq!(
@@ -211,6 +288,8 @@ mod tests {
             )
         );
         assert_eq!(market_identity.scope, UsdMStreamConnectionScope::Market);
+        assert!(!market.sdk_manages_session_replacement());
+        assert_eq!(market.renewal_enqueue_count(), 0);
         assert_eq!(
             market.routed_target().unwrap().path_scope,
             RoutedStreamScope::Market
@@ -223,6 +302,8 @@ mod tests {
         assert_eq!(paths.recv().await.as_deref(), Some("/private/stream"));
         let private_identity = private.connection_identity().unwrap();
         assert_eq!(private_identity.scope, UsdMStreamConnectionScope::Private);
+        assert!(private.sdk_manages_session_replacement());
+        assert_eq!(private.renewal_enqueue_count(), 1);
         assert_eq!(
             opens.recv().await.unwrap(),
             (
@@ -237,6 +318,152 @@ mod tests {
         public.disconnect().await.unwrap();
         market.disconnect().await.unwrap();
         private.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn routed_exact_scopes_wait_for_caller_managed_replacement() {
+        assert_routed_scope_does_not_reconnect(UsdMStreamConnectionScope::Public).await;
+        assert_routed_scope_does_not_reconnect(UsdMStreamConnectionScope::Market).await;
+    }
+
+    #[tokio::test]
+    async fn routed_exact_scopes_do_not_enqueue_sdk_renewal() {
+        let (handle, mut paths, mut opens) = scoped_test_handle(4).await;
+        let public = handle
+            .connect_scope(UsdMStreamConnectionScope::Public)
+            .await
+            .unwrap();
+        let market = handle
+            .connect_scope(UsdMStreamConnectionScope::Market)
+            .await
+            .unwrap();
+        let mut opened_paths = vec![paths.recv().await.unwrap(), paths.recv().await.unwrap()];
+        opened_paths.sort_unstable();
+        assert_eq!(opened_paths, vec!["/market/stream", "/public/stream"]);
+        assert!(opens.recv().await.is_some());
+        assert!(opens.recv().await.is_some());
+        let public_identity = public.connection_identity().unwrap();
+        let market_identity = market.connection_identity().unwrap();
+        assert_eq!(public.renewal_enqueue_count(), 0);
+        assert_eq!(market.renewal_enqueue_count(), 0);
+        assert!(opens.try_recv().is_err());
+        assert!(paths.try_recv().is_err());
+        assert_eq!(public.connection_identity().unwrap(), public_identity);
+        assert_eq!(market.connection_identity().unwrap(), market_identity);
+        public.disconnect().await.unwrap();
+        market.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_exact_scope_retains_sdk_managed_reconnect() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (drop_sender, drop_receiver) = oneshot::channel();
+        let (path_sender, mut path_receiver) = unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (first_stream, _) = listener.accept().await.unwrap();
+            let first_path_sender = path_sender.clone();
+            let first = accept_hdr_async(
+                first_stream,
+                move |request: &Request, response: Response| {
+                    first_path_sender
+                        .send(request.uri().path().to_string())
+                        .unwrap();
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            drop_receiver.await.unwrap();
+            drop(first);
+
+            let (second_stream, _) = timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("private exact client did not reconnect")
+                .unwrap();
+            let second = accept_hdr_async(
+                second_stream,
+                move |request: &Request, response: Response| {
+                    path_sender.send(request.uri().path().to_string()).unwrap();
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            let mut second = second;
+            while second.next().await.is_some() {}
+        });
+
+        let (open_sender, mut open_receiver) = unbounded_channel();
+        let observer = RawFrameObserver::new_context(|_| {}).with_lifecycle(move |context| {
+            if context.event == WebsocketLifecycleEvent::Open {
+                let _ = open_sender.send((
+                    context.connection_id.to_string(),
+                    context.session_generation,
+                    context.path_scope.map(str::to_string),
+                ));
+            }
+        });
+        let configuration = ConfigurationWebsocketStreams::builder()
+            .ws_url(format!("ws://{address}"))
+            .reconnect_delay(10_u64)
+            .raw_frame_observer(observer)
+            .build()
+            .unwrap();
+        let private = WebsocketStreamsHandle::new(configuration)
+            .connect_scope(UsdMStreamConnectionScope::Private)
+            .await
+            .unwrap();
+        assert!(private.sdk_manages_session_replacement());
+        assert_eq!(
+            path_receiver.recv().await.as_deref(),
+            Some("/private/stream")
+        );
+        let first_open = open_receiver.recv().await.unwrap();
+        drop_sender.send(()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), path_receiver.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("/private/stream")
+        );
+        let second_open = timeout(Duration::from_secs(1), open_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_open.0, first_open.0);
+        assert_eq!(second_open.1, first_open.1 + 1);
+        assert_eq!(second_open.2.as_deref(), Some("private"));
+        assert_eq!(
+            private.connection_identity().unwrap().session_generation,
+            second_open.1
+        );
+
+        private.disconnect().await.unwrap();
+        timeout(Duration::from_secs(1), server)
+            .await
+            .expect("private mock server did not observe terminal disconnect")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn generic_client_retains_sdk_managed_recovery_mode() {
+        let (handle, mut paths, mut opens) = scoped_test_handle(3).await;
+        let generic = handle.connect().await.unwrap();
+        assert!(generic.sdk_manages_session_replacement());
+
+        let mut opened_paths = Vec::new();
+        for _ in 0..3 {
+            opened_paths.push(paths.recv().await.unwrap());
+            assert!(opens.recv().await.is_some());
+        }
+        opened_paths.sort_unstable();
+        assert_eq!(
+            opened_paths,
+            vec!["/market/stream", "/private/stream", "/public/stream"]
+        );
+        generic.disconnect().await.unwrap();
     }
 
     #[tokio::test]
